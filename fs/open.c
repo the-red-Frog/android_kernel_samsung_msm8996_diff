@@ -34,6 +34,10 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
+
 int do_truncate2(struct vfsmount *mnt, struct dentry *dentry, loff_t length,
 		unsigned int time_attrs, struct file *filp)
 {
@@ -355,25 +359,6 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 				override_cred->cap_permitted;
 	}
 
-	/*
-	 * The new set of credentials can *only* be used in
-	 * task-synchronous circumstances, and does not need
-	 * RCU freeing, unless somebody then takes a separate
-	 * reference to it.
-	 *
-	 * NOTE! This is _only_ true because this credential
-	 * is used purely for override_creds() that installs
-	 * it as the subjective cred. Other threads will be
-	 * accessing ->real_cred, not the subjective cred.
-	 *
-	 * If somebody _does_ make a copy of this (using the
-	 * 'get_current_cred()' function), that will clear the
-	 * non_rcu field, because now that other user may be
-	 * expecting RCU freeing. But normal thread-synchronous
-	 * cred accesses will keep things non-RCY.
-	 */
-	override_cred->non_rcu = 1;
-
 	old_cred = override_creds(override_cred);
 retry:
 	res = user_path_at(dfd, filename, lookup_flags, &path);
@@ -389,7 +374,7 @@ retry:
 		 * with the "noexec" flag.
 		 */
 		res = -EACCES;
-		if (path.mnt->mnt_flags & MNT_NOEXEC)
+		if (path_noexec(&path))
 			goto out_path_release;
 	}
 
@@ -851,12 +836,16 @@ EXPORT_SYMBOL(finish_no_open);
 int vfs_open(const struct path *path, struct file *file,
 	     const struct cred *cred)
 {
-	struct inode *inode = vfs_select_inode(path->dentry, file->f_flags);
-
-	if (IS_ERR(inode))
-		return PTR_ERR(inode);
+	struct dentry *dentry = path->dentry;
+	struct inode *inode = dentry->d_inode;
 
 	file->f_path = *path;
+	if (dentry->d_flags & DCACHE_OP_SELECT_INODE) {
+		inode = dentry->d_op->d_select_inode(dentry, file->f_flags);
+		if (IS_ERR(inode))
+			return PTR_ERR(inode);
+	}
+
 	return do_dentry_open(file, inode, NULL, cred);
 }
 
@@ -895,12 +884,6 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
 {
 	int lookup_flags = 0;
 	int acc_mode;
-
-	/*
-	 * Clear out all open flags we don't know about so that we don't report
-	 * them in fcntl(F_GETFD) or similar interfaces.
-	 */
-	flags &= VALID_OPEN_FLAGS;
 
 	if (flags & (O_CREAT | __O_TMPFILE))
 		op->mode = (mode & S_IALLUGO) | S_IFREG;
@@ -1031,6 +1014,13 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 	fd = get_unused_fd_flags(flags);
 	if (fd >= 0) {
 		struct file *f = do_filp_open(dfd, tmp, &op);
+
+#ifdef CONFIG_SECURITY_DEFEX
+		if (!IS_ERR(f) && task_defex_enforce(current, f, -__NR_openat)) {
+			fput(f);
+			f = ERR_PTR(-EPERM);
+		}
+#endif
 		if (IS_ERR(f)) {
 			put_unused_fd(fd);
 			fd = PTR_ERR(f);
@@ -1160,21 +1150,3 @@ int nonseekable_open(struct inode *inode, struct file *filp)
 }
 
 EXPORT_SYMBOL(nonseekable_open);
-
-/*
- * stream_open is used by subsystems that want stream-like file descriptors.
- * Such file descriptors are not seekable and don't have notion of position
- * (file.f_pos is always 0). Contrary to file descriptors of other regular
- * files, .read() and .write() can run simultaneously.
- *
- * stream_open never fails and is marked to return int so that it could be
- * directly used as file_operations.open .
- */
-int stream_open(struct inode *inode, struct file *filp)
-{
-	filp->f_mode &= ~(FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE | FMODE_ATOMIC_POS);
-	filp->f_mode |= FMODE_STREAM;
-	return 0;
-}
-
-EXPORT_SYMBOL(stream_open);

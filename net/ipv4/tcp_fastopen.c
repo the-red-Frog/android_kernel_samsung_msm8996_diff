@@ -7,6 +7,9 @@
 #include <linux/rculist.h>
 #include <net/inetpeer.h>
 #include <net/tcp.h>
+#ifdef CONFIG_MPTCP
+#include <net/mptcp.h>
+#endif
 
 int sysctl_tcp_fastopen __read_mostly = TFO_CLIENT_ENABLE;
 
@@ -112,7 +115,7 @@ static bool tcp_fastopen_cookie_gen(struct request_sock *req,
 		struct tcp_fastopen_cookie tmp;
 
 		if (__tcp_fastopen_cookie_gen(&ip6h->saddr, &tmp)) {
-			struct in6_addr *buf = &tmp.addr;
+			struct in6_addr *buf = (struct in6_addr *) tmp.val;
 			int i;
 
 			for (i = 0; i < 4; i++)
@@ -132,6 +135,9 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 	struct tcp_sock *tp;
 	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
 	struct sock *child;
+#ifdef CONFIG_MPTCP
+	struct sock *meta_sk;
+#endif
 	u32 end_seq;
 
 	req->num_retrans = 0;
@@ -164,7 +170,6 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 	 * scaled. So correct it appropriately.
 	 */
 	tp->snd_wnd = ntohs(tcp_hdr(skb)->window);
-	tp->max_window = tp->snd_wnd;
 
 	/* Activate the retrans timer so that SYNACK can be retransmitted.
 	 * The request socket is not added to the SYN table of the parent
@@ -176,12 +181,14 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 	/* Add the child socket directly into the accept queue */
 	inet_csk_reqsk_queue_add(sk, req, child);
 
+#ifndef CONFIG_MPTCP
 	/* Now finish processing the fastopen child socket. */
 	inet_csk(child)->icsk_af_ops->rebuild_header(child);
 	tcp_init_congestion_control(child);
 	tcp_mtup_init(child);
 	tcp_init_metrics(child);
 	tcp_init_buffer_space(child);
+#endif
 
 	/* Queue the data carried in the SYN packet. We need to first
 	 * bump skb's refcnt because the caller will attempt to free it.
@@ -209,13 +216,38 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 			skb_set_owner_r(skb2, child);
 			__skb_queue_tail(&child->sk_receive_queue, skb2);
 			tp->syn_data_acked = 1;
+
+			/* u64_stats_update_begin(&tp->syncp) not needed here,
+			 * as we certainly are not changing upper 32bit value (0)
+			 */
+			tp->bytes_received = end_seq - TCP_SKB_CB(skb)->seq - 1;
 		} else {
 			end_seq = TCP_SKB_CB(skb)->seq + 1;
 		}
 	}
 	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = end_seq;
+#ifdef CONFIG_MPTCP
+	meta_sk = child;
+	if (!mptcp_check_req_fastopen(meta_sk, req)) {
+		child = tcp_sk(meta_sk)->mpcb->master_sk;
+		tp = tcp_sk(child);
+	}
+
+	/* Now finish processing the fastopen child socket. */
+	inet_csk(child)->icsk_af_ops->rebuild_header(child);
+	tcp_init_congestion_control(child);
+	tcp_mtup_init(child);
+	tcp_init_metrics(child);
+	tp->ops->init_buffer_space(child);
+#endif
 	sk->sk_data_ready(sk);
-	bh_unlock_sock(child);
+#ifdef CONFIG_MPTCP
+	if (mptcp(tcp_sk(child)))
+#endif
+		bh_unlock_sock(child);
+#ifdef CONFIG_MPTCP
+	bh_unlock_sock(meta_sk);
+#endif
 	sock_put(child);
 	WARN_ON(req->sk == NULL);
 	return true;

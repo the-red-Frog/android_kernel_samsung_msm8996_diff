@@ -3158,7 +3158,7 @@ msi_set_affinity(struct irq_data *data, const struct cpumask *mask, bool force)
 	msg.address_lo &= ~MSI_ADDR_DEST_ID_MASK;
 	msg.address_lo |= MSI_ADDR_DEST_ID(dest);
 
-	__write_msi_msg(data->msi_desc, &msg);
+	__pci_write_msi_msg(data->msi_desc, &msg);
 
 	return IRQ_SET_MASK_OK_NOCOPY;
 }
@@ -3169,8 +3169,8 @@ msi_set_affinity(struct irq_data *data, const struct cpumask *mask, bool force)
  */
 static struct irq_chip msi_chip = {
 	.name			= "PCI-MSI",
-	.irq_unmask		= unmask_msi_irq,
-	.irq_mask		= mask_msi_irq,
+	.irq_unmask		= pci_msi_unmask_irq,
+	.irq_mask		= pci_msi_mask_irq,
 	.irq_ack		= ack_apic_edge,
 	.irq_set_affinity	= msi_set_affinity,
 	.irq_retrigger		= ioapic_retrigger_irq,
@@ -3196,7 +3196,7 @@ int setup_msi_irq(struct pci_dev *dev, struct msi_desc *msidesc,
 	 * MSI message denotes a contiguous group of IRQs, written for 0th IRQ.
 	 */
 	if (!irq_offset)
-		write_msi_msg(irq, &msg);
+		pci_write_msi_msg(irq, &msg);
 
 	setup_remapped_irq(irq, irq_cfg(irq), chip);
 
@@ -3473,13 +3473,7 @@ unsigned int arch_dynirq_lower_bound(unsigned int from)
 	 * dmar_alloc_hwirq() may be called before setup_IO_APIC(), so use
 	 * gsi_top if ioapic_dynirq_base hasn't been initialized yet.
 	 */
-	if (!ioapic_initialized)
-		return gsi_top;
-	/*
-	 * For DT enabled machines ioapic_dynirq_base is irrelevant and not
-	 * updated. So simply return @from if ioapic_dynirq_base == 0.
-	 */
-	return ioapic_dynirq_base ? : from;
+	return ioapic_initialized ? ioapic_dynirq_base : gsi_top;
 }
 
 int __init arch_probe_nr_irqs(void)
@@ -3647,7 +3641,6 @@ void __init setup_ioapic_dest(void)
 {
 	int pin, ioapic, irq, irq_entry;
 	const struct cpumask *mask;
-	struct irq_desc *desc;
 	struct irq_data *idata;
 
 	if (skip_ioapic_setup == 1)
@@ -3662,9 +3655,7 @@ void __init setup_ioapic_dest(void)
 		if (irq < 0 || !mp_init_irq_at_boot(ioapic, irq))
 			continue;
 
-		desc = irq_to_desc(irq);
-		raw_spin_lock_irq(&desc->lock);
-		idata = irq_desc_get_irq_data(desc);
+		idata = irq_get_irq_data(irq);
 
 		/*
 		 * Honour affinities which have been set in early boot
@@ -3675,7 +3666,6 @@ void __init setup_ioapic_dest(void)
 			mask = apic->target_cpus();
 
 		x86_io_apic_ops.set_affinity(idata, mask, false);
-		raw_spin_unlock_irq(&desc->lock);
 	}
 
 }

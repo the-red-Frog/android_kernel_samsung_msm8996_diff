@@ -61,7 +61,6 @@
 #include <linux/rhashtable.h>
 #include <asm/cacheflush.h>
 #include <linux/hash.h>
-#include <linux/nospec.h>
 
 #include <net/net_namespace.h>
 #include <net/sock.h>
@@ -270,6 +269,11 @@ static int __netlink_deliver_tap_skb(struct sk_buff *skb,
 	struct sk_buff *nskb;
 	struct sock *sk = skb->sk;
 	int ret = -ENOMEM;
+	
+	if (!net_eq(dev_net(dev), sock_net(sk)) &&
+		!net_eq(dev_net(dev), &init_net)) {
+		return 0;
+	}
 
 	if (!net_eq(dev_net(dev), sock_net(sk)))
 		return 0;
@@ -372,11 +376,14 @@ static void netlink_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
 	sk_mem_charge(sk, skb->truesize);
 }
 
-static void __netlink_sock_destruct(struct sock *sk)
+static void netlink_sock_destruct(struct sock *sk)
 {
 	struct netlink_sock *nlk = nlk_sk(sk);
 
 	if (nlk->cb_running) {
+		if (nlk->cb.done)
+			nlk->cb.done(&nlk->cb);
+
 		module_put(nlk->cb.module);
 		kfree_skb(nlk->cb.skb);
 	}
@@ -391,28 +398,6 @@ static void __netlink_sock_destruct(struct sock *sk)
 	WARN_ON(atomic_read(&sk->sk_rmem_alloc));
 	WARN_ON(atomic_read(&sk->sk_wmem_alloc));
 	WARN_ON(nlk_sk(sk)->groups);
-}
-
-static void netlink_sock_destruct_work(struct work_struct *work)
-{
-	struct netlink_sock *nlk = container_of(work, struct netlink_sock,
-						work);
-
-	nlk->cb.done(&nlk->cb);
-	__netlink_sock_destruct(&nlk->sk);
-}
-
-static void netlink_sock_destruct(struct sock *sk)
-{
-	struct netlink_sock *nlk = nlk_sk(sk);
-
-	if (nlk->cb_running && nlk->cb.done) {
-		INIT_WORK(&nlk->work, netlink_sock_destruct_work);
-		schedule_work(&nlk->work);
-		return;
-	}
-
-	__netlink_sock_destruct(sk);
 }
 
 /* This lock without WQ_FLAG_EXCLUSIVE is good on UP and it is _very_ bad on
@@ -456,13 +441,11 @@ void netlink_table_ungrab(void)
 static inline void
 netlink_lock_table(void)
 {
-	unsigned long flags;
-
 	/* read_lock() synchronizes us to netlink_table_grab */
 
-	read_lock_irqsave(&nl_table_lock, flags);
+	read_lock(&nl_table_lock);
 	atomic_inc(&nl_table_users);
-	read_unlock_irqrestore(&nl_table_lock, flags);
+	read_unlock(&nl_table_lock);
 }
 
 static inline void
@@ -639,7 +622,6 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 
 	if (protocol < 0 || protocol >= MAX_LINKS)
 		return -EPROTONOSUPPORT;
-	protocol = array_index_nospec(protocol, MAX_LINKS);
 
 	netlink_lock_table();
 #ifdef CONFIG_MODULES
@@ -910,7 +892,7 @@ static void netlink_unbind(int group, long unsigned int groups,
 
 	for (undo = 0; undo < group; undo++)
 		if (test_bit(undo, &groups))
-			nlk->netlink_unbind(undo);
+			nlk->netlink_unbind(undo + 1);
 }
 
 static int netlink_bind(struct socket *sock, struct sockaddr *addr,
@@ -938,11 +920,6 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 			return err;
 	}
 
-	if (nlk->ngroups == 0)
-		groups = 0;
-	else if (nlk->ngroups < 8*sizeof(groups))
-		groups &= (1UL << nlk->ngroups) - 1;
-
 	if (nlk->portid)
 		if (nladdr->nl_pid != nlk->portid)
 			return -EINVAL;
@@ -953,7 +930,7 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 		for (group = 0; group < nlk->ngroups; group++) {
 			if (!test_bit(group, &groups))
 				continue;
-			err = nlk->netlink_bind(group);
+			err = nlk->netlink_bind(group + 1);
 			if (!err)
 				continue;
 			netlink_unbind(group, groups, nlk);
@@ -1338,7 +1315,7 @@ static void do_one_broadcast(struct sock *sk,
 	sock_hold(sk);
 	if (p->skb2 == NULL) {
 		if (skb_shared(p->skb)) {
-			p->skb2 = skb_clone(p->skb, p->allocation);
+			p->skb2 = skb_copy(p->skb, p->allocation);
 		} else {
 			p->skb2 = skb_get(p->skb);
 			/*

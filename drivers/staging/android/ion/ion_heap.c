@@ -2,6 +2,7 @@
  * drivers/staging/android/ion/ion_heap.c
  *
  * Copyright (C) 2011 Google, Inc.
+ * Copyright (c) 2011-2016, The Linux Foundation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -22,6 +23,9 @@
 #include <linux/sched.h>
 #include <linux/scatterlist.h>
 #include <linux/vmalloc.h>
+#include <linux/slab.h>
+#include <linux/highmem.h>
+#include <linux/dma-mapping.h>
 #include "ion.h"
 #include "ion_priv.h"
 
@@ -105,12 +109,12 @@ int ion_heap_map_user(struct ion_heap *heap, struct ion_buffer *buffer,
 
 static int ion_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
 {
-	void *addr = vmap(pages, num, VM_MAP, pgprot);
+	void *addr = vm_map_ram(pages, num, -1, pgprot);
 
 	if (!addr)
 		return -ENOMEM;
 	memset(addr, 0, PAGE_SIZE * num);
-	vunmap(addr);
+	vm_unmap_ram(addr, num);
 
 	return 0;
 }
@@ -253,8 +257,6 @@ int ion_heap_init_deferred_free(struct ion_heap *heap)
 	struct sched_param param = { .sched_priority = 0 };
 
 	INIT_LIST_HEAD(&heap->free_list);
-	heap->free_list_size = 0;
-	spin_lock_init(&heap->free_lock);
 	init_waitqueue_head(&heap->waitqueue);
 	heap->task = kthread_run(ion_heap_deferred_free, heap,
 				 "%s", heap->name);
@@ -329,6 +331,11 @@ struct ion_heap *ion_heap_create(struct ion_platform_heap *heap_data)
 	case ION_HEAP_TYPE_SYSTEM:
 		heap = ion_system_heap_create(heap_data);
 		break;
+#ifdef CONFIG_ION_RBIN_HEAP
+	case ION_HEAP_TYPE_RBIN:
+		heap = ion_rbin_heap_create(heap_data);
+		break;
+#endif
 	case ION_HEAP_TYPE_CARVEOUT:
 		heap = ion_carveout_heap_create(heap_data);
 		break;
@@ -345,14 +352,15 @@ struct ion_heap *ion_heap_create(struct ion_platform_heap *heap_data)
 	}
 
 	if (IS_ERR_OR_NULL(heap)) {
-		pr_err("%s: error creating heap %s type %d base %lu size %zu\n",
+		pr_err("%s: error creating heap %s type %d base %pa size %zu\n",
 		       __func__, heap_data->name, heap_data->type,
-		       heap_data->base, heap_data->size);
+		       &heap_data->base, heap_data->size);
 		return ERR_PTR(-EINVAL);
 	}
 
 	heap->name = heap_data->name;
 	heap->id = heap_data->id;
+	heap->priv = heap_data->priv;
 	return heap;
 }
 
@@ -369,6 +377,11 @@ void ion_heap_destroy(struct ion_heap *heap)
 	case ION_HEAP_TYPE_SYSTEM:
 		ion_system_heap_destroy(heap);
 		break;
+#ifdef CONFIG_ION_RBIN_HEAP
+	case ION_HEAP_TYPE_RBIN:
+		ion_rbin_heap_destroy(heap);
+		break;
+#endif
 	case ION_HEAP_TYPE_CARVEOUT:
 		ion_carveout_heap_destroy(heap);
 		break;

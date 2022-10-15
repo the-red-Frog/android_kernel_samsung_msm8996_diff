@@ -334,16 +334,13 @@ extern bool xen_biovec_phys_mergeable(const struct bio_vec *vec1,
 #define IO_SPACE_LIMIT 0xffff
 
 #ifdef CONFIG_MTRR
+extern int __must_check arch_phys_wc_index(int handle);
+#define arch_phys_wc_index arch_phys_wc_index
+
 extern int __must_check arch_phys_wc_add(unsigned long base,
 					 unsigned long size);
 extern void arch_phys_wc_del(int handle);
 #define arch_phys_wc_add arch_phys_wc_add
-#endif
-
-#ifdef CONFIG_X86_PAT
-extern int arch_io_reserve_memtype_wc(resource_size_t start, resource_size_t size);
-extern void arch_io_free_memtype_wc(resource_size_t start, resource_size_t size);
-#define arch_io_reserve_memtype_wc arch_io_reserve_memtype_wc
 #endif
 
 #endif /* _ASM_X86_IO_H */

@@ -22,6 +22,10 @@
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
+
 typedef ssize_t (*io_fn_t)(struct file *, char __user *, size_t, loff_t *);
 typedef ssize_t (*iov_fn_t)(struct kiocb *, const struct iovec *,
 		unsigned long, loff_t);
@@ -528,6 +532,10 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 
 	ret = rw_verify_area(WRITE, file, pos, count);
 	if (ret >= 0) {
+#ifdef CONFIG_SECURITY_DEFEX
+		if (task_defex_enforce(current, file, -__NR_write))
+			return -EPERM;
+#endif
 		count = ret;
 		file_start_write(file);
 		if (file->f_op->write)
@@ -551,13 +559,12 @@ EXPORT_SYMBOL(vfs_write);
 
 static inline loff_t file_pos_read(struct file *file)
 {
-	return file->f_mode & FMODE_STREAM ? 0 : file->f_pos;
+	return file->f_pos;
 }
 
 static inline void file_pos_write(struct file *file, loff_t pos)
 {
-	if ((file->f_mode & FMODE_STREAM) == 0)
-		file->f_pos = pos;
+	file->f_pos = pos;
 }
 
 SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)

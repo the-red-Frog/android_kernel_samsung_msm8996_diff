@@ -50,22 +50,6 @@ extern void __chk_io_ptr(const volatile void __iomem *);
 
 #ifdef __KERNEL__
 
-/*
- * Minimal backport of compiler_attributes.h to add support for __copy
- * to v4.9.y so that we can use it in init/exit_module to avoid
- * -Werror=missing-attributes errors on GCC 9.
- */
-#ifndef __has_attribute
-# define __has_attribute(x) __GCC4_has_attribute_##x
-# define __GCC4_has_attribute___copy__                0
-#endif
-
-#if __has_attribute(__copy__)
-# define __copy(symbol)                 __attribute__((__copy__(symbol)))
-#else
-# define __copy(symbol)
-#endif
-
 #ifdef __GNUC__
 #include <linux/compiler-gcc.h>
 #endif
@@ -185,11 +169,6 @@ void ftrace_likely_update(struct ftrace_branch_data *f, int val, int expect);
 # define barrier_data(ptr) barrier()
 #endif
 
-/* workaround for GCC PR82365 if needed */
-#ifndef barrier_before_unreachable
-# define barrier_before_unreachable() do { } while (0)
-#endif
-
 /* Unreachable code */
 #ifndef unreachable
 # define unreachable() do { } while (1)
@@ -213,32 +192,45 @@ void ftrace_likely_update(struct ftrace_branch_data *f, int val, int expect);
 
 #include <uapi/linux/types.h>
 
-static __always_inline void data_access_exceeds_word_size(void)
-#ifdef __compiletime_warning
-__compiletime_warning("data access exceeds word size and won't be atomic")
-#endif
-;
+#define __READ_ONCE_SIZE						\
+({									\
+	switch (size) {							\
+	case 1: *(__u8 *)res = *(volatile __u8 *)p; break;		\
+	case 2: *(__u16 *)res = *(volatile __u16 *)p; break;		\
+	case 4: *(__u32 *)res = *(volatile __u32 *)p; break;		\
+	case 8: *(__u64 *)res = *(volatile __u64 *)p; break;		\
+	default:							\
+		barrier();						\
+		__builtin_memcpy((void *)res, (const void *)p, size);	\
+		barrier();						\
+	}								\
+})
 
-static __always_inline void data_access_exceeds_word_size(void)
+static __always_inline
+void __read_once_size(const volatile void *p, void *res, int size)
 {
+	__READ_ONCE_SIZE;
 }
 
-static __always_inline void __read_once_size(const volatile void *p, void *res, int size)
+#ifdef CONFIG_KASAN
+/*
+ * This function is not 'inline' because __no_sanitize_address confilcts
+ * with inlining. Attempt to inline it may cause a build failure.
+ * 	https://gcc.gnu.org/bugzilla/show_bug.cgi?id=67368
+ * '__maybe_unused' allows us to avoid defined-but-not-used warnings.
+ */
+static __no_sanitize_address __maybe_unused
+void __read_once_size_nocheck(const volatile void *p, void *res, int size)
 {
-	switch (size) {
-	case 1: *(__u8 *)res = *(volatile __u8 *)p; break;
-	case 2: *(__u16 *)res = *(volatile __u16 *)p; break;
-	case 4: *(__u32 *)res = *(volatile __u32 *)p; break;
-#ifdef CONFIG_64BIT
-	case 8: *(__u64 *)res = *(volatile __u64 *)p; break;
-#endif
-	default:
-		barrier();
-		__builtin_memcpy((void *)res, (const void *)p, size);
-		data_access_exceeds_word_size();
-		barrier();
-	}
+	__READ_ONCE_SIZE;
 }
+#else
+static __always_inline
+void __read_once_size_nocheck(const volatile void *p, void *res, int size)
+{
+	__READ_ONCE_SIZE;
+}
+#endif
 
 static __always_inline void __write_once_size(volatile void *p, void *res, int size)
 {
@@ -246,13 +238,10 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
 	case 1: *(volatile __u8 *)p = *(__u8 *)res; break;
 	case 2: *(volatile __u16 *)p = *(__u16 *)res; break;
 	case 4: *(volatile __u32 *)p = *(__u32 *)res; break;
-#ifdef CONFIG_64BIT
 	case 8: *(volatile __u64 *)p = *(__u64 *)res; break;
-#endif
 	default:
 		barrier();
 		__builtin_memcpy((void *)p, (const void *)res, size);
-		data_access_exceeds_word_size();
 		barrier();
 	}
 }
@@ -279,8 +268,22 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
  * required ordering.
  */
 
-#define READ_ONCE(x) \
-	({ union { typeof(x) __val; char __c[1]; } __u; __read_once_size(&(x), __u.__c, sizeof(x)); __u.__val; })
+#define __READ_ONCE(x, check)						\
+({									\
+	union { typeof(x) __val; char __c[1]; } __u;			\
+	if (check)							\
+		__read_once_size(&(x), __u.__c, sizeof(x));		\
+	else								\
+		__read_once_size_nocheck(&(x), __u.__c, sizeof(x));	\
+	__u.__val;							\
+})
+#define READ_ONCE(x) __READ_ONCE(x, 1)
+
+/*
+ * Use READ_ONCE_NOCHECK() instead of READ_ONCE() if you need
+ * to hide memory access from KASAN.
+ */
+#define READ_ONCE_NOCHECK(x) __READ_ONCE(x, 0)
 
 #define WRITE_ONCE(x, val) \
 	({ typeof(x) __val = (val); __write_once_size(&(x), &__val, sizeof(__val)); __val; })
@@ -410,7 +413,7 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
 
 /* Is this type a native word size -- useful for atomic operations */
 #ifndef __native_word
-# define __native_word(t) (sizeof(t) == sizeof(char) || sizeof(t) == sizeof(short) || sizeof(t) == sizeof(int) || sizeof(t) == sizeof(long))
+# define __native_word(t) (sizeof(t) == sizeof(int) || sizeof(t) == sizeof(long))
 #endif
 
 /* Compile time object size, -1 for unknown */
@@ -459,7 +462,7 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
  * compiler has support to do so.
  */
 #define compiletime_assert(condition, msg) \
-	_compiletime_assert(condition, msg, __compiletime_assert_, __COUNTER__)
+	_compiletime_assert(condition, msg, __compiletime_assert_, __LINE__)
 
 #define compiletime_assert_atomic_type(t)				\
 	compiletime_assert(__native_word(t),				\
@@ -502,11 +505,4 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
 # define __kprobes
 # define nokprobe_inline	inline
 #endif
-
-/*
- * This is needed in functions which generate the stack canary, see
- * arch/x86/kernel/smpboot.c::start_secondary() for an example.
- */
-#define prevent_tail_call_optimization()	mb()
-
 #endif /* __LINUX_COMPILER_H */

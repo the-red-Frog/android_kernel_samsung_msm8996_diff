@@ -713,7 +713,6 @@ access the palette, this must be done with ioctls of the Linux framebuffer API.<
     &sub-srggb8;
     &sub-sbggr16;
     &sub-srggb10;
-    &sub-srggb10p;
     &sub-srggb10alaw8;
     &sub-srggb10dpcm8;
     &sub-srggb12;
@@ -846,6 +845,11 @@ extended control <constant>V4L2_CID_MPEG_STREAM_TYPE</constant>, see
 		<entry><constant>V4L2_PIX_FMT_VP8</constant></entry>
 		<entry>'VP80'</entry>
 		<entry>VP8 video elementary stream.</entry>
+	  </row>
+	  <row id="V4L2-PIX-FMT-VP9">
+		<entry><constant>V4L2_PIX_FMT_VP9</constant></entry>
+		<entry>'VP9'</entry>
+		<entry>VP9 video elementary stream.</entry>
 	  </row>
 	</tbody>
       </tgroup>

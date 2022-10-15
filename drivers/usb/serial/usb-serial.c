@@ -314,7 +314,10 @@ static void serial_cleanup(struct tty_struct *tty)
 	serial = port->serial;
 	owner = serial->type->driver.owner;
 
-	usb_autopm_put_interface(serial->interface);
+	mutex_lock(&serial->disc_mutex);
+	if (!serial->disconnected)
+		usb_autopm_put_interface(serial->interface);
+	mutex_unlock(&serial->disc_mutex);
 
 	usb_serial_put(serial);
 	module_put(owner);
@@ -1058,8 +1061,7 @@ static int usb_serial_probe(struct usb_interface *interface,
 
 	serial->disconnected = 0;
 
-	if (num_ports > 0)
-		usb_serial_console_init(serial->port[0]->minor);
+	usb_serial_console_init(serial->port[0]->minor);
 exit:
 	module_put(type->driver.owner);
 	return 0;
@@ -1334,9 +1336,6 @@ static int usb_serial_register(struct usb_serial_driver *driver)
 		return -EINVAL;
 	}
 
-	/* Prevent individual ports from being unbound. */
-	driver->driver.suppress_bind_attrs = true;
-
 	usb_serial_operations_init(driver);
 
 	/* Add this device to our list of devices */
@@ -1417,7 +1416,7 @@ int usb_serial_register_drivers(struct usb_serial_driver *const serial_drivers[]
 
 	rc = usb_register(udriver);
 	if (rc)
-		goto failed_usb_register;
+		return rc;
 
 	for (sd = serial_drivers; *sd; ++sd) {
 		(*sd)->usb_driver = udriver;
@@ -1435,8 +1434,6 @@ int usb_serial_register_drivers(struct usb_serial_driver *const serial_drivers[]
 	while (sd-- > serial_drivers)
 		usb_serial_deregister(*sd);
 	usb_deregister(udriver);
-failed_usb_register:
-	kfree(udriver);
 	return rc;
 }
 EXPORT_SYMBOL_GPL(usb_serial_register_drivers);

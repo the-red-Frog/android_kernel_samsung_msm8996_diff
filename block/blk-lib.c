@@ -26,6 +26,89 @@ static void bio_batch_end_io(struct bio *bio, int err)
 	bio_put(bio);
 }
 
+/* copied from block/blk-lib.c in 4.10-rc1 */
+int __blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+		sector_t nr_sects, gfp_t gfp_mask, unsigned long flags,
+		struct bio **biop)
+{
+	struct request_queue *q = bdev_get_queue(bdev);
+	struct bio *bio = *biop;
+	unsigned int granularity;
+	int op = REQ_WRITE | REQ_DISCARD;
+	int alignment;
+	sector_t bs_mask;
+
+	if (!q)
+		return -ENXIO;
+
+	if (!blk_queue_discard(q))
+		return -EOPNOTSUPP;
+
+	if (flags & BLKDEV_DISCARD_SECURE) {
+		if (!blk_queue_secdiscard(q))
+			return -EOPNOTSUPP;
+		op |= REQ_SECURE;
+	}
+
+	bs_mask = (bdev_logical_block_size(bdev) >> 9) - 1;
+	if ((sector | nr_sects) & bs_mask)
+		return -EINVAL;
+
+	/* Zero-sector (unknown) and one-sector granularities are the same.  */
+	granularity = max(q->limits.discard_granularity >> 9, 1U);
+	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
+
+	while (nr_sects) {
+		unsigned int req_sects;
+		sector_t end_sect, tmp;
+
+		/* Make sure bi_size doesn't overflow */
+		req_sects = min_t(sector_t, nr_sects, UINT_MAX >> 9);
+
+		/**
+		 * If splitting a request, and the next starting sector would be
+		 * misaligned, stop the discard at the previous aligned sector.
+		 */
+		end_sect = sector + req_sects;
+		tmp = end_sect;
+		if (req_sects < nr_sects &&
+		    sector_div(tmp, granularity) != alignment) {
+			end_sect = end_sect - alignment;
+			sector_div(end_sect, granularity);
+			end_sect = end_sect * granularity + alignment;
+			req_sects = end_sect - sector;
+		}
+
+		if (bio) {
+			int ret = submit_bio_wait(op, bio);
+			bio_put(bio);
+			if (ret)
+				return ret;
+		}
+
+		bio = bio_alloc(GFP_NOIO | __GFP_NOFAIL, 1);
+		bio->bi_iter.bi_sector = sector;
+		bio->bi_bdev = bdev;
+		bio->bi_rw = op | 0;
+
+		bio->bi_iter.bi_size = req_sects << 9;
+		nr_sects -= req_sects;
+		sector = end_sect;
+
+		/*
+		 * We can loop for a long time in here, if someone does
+		 * full device discards (like mkfs). Be nice and allow
+		 * us to schedule out to avoid softlocking if preempt
+		 * is disabled.
+		 */
+		cond_resched();
+	}
+
+	*biop = bio;
+	return 0;
+}
+EXPORT_SYMBOL(__blkdev_issue_discard);
+
 /**
  * blkdev_issue_discard - queue a discard
  * @bdev:	blockdev to issue discard for
@@ -40,102 +123,21 @@ static void bio_batch_end_io(struct bio *bio, int err)
 int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 		sector_t nr_sects, gfp_t gfp_mask, unsigned long flags)
 {
-	DECLARE_COMPLETION_ONSTACK(wait);
-	struct request_queue *q = bdev_get_queue(bdev);
-	int type = REQ_WRITE | REQ_DISCARD;
-	unsigned int max_discard_sectors, granularity;
-	int alignment;
-	struct bio_batch bb;
-	struct bio *bio;
-	int ret = 0;
+	struct bio *bio = NULL;
 	struct blk_plug plug;
-
-	if (!q)
-		return -ENXIO;
-
-	if (!blk_queue_discard(q))
-		return -EOPNOTSUPP;
-
-	/* Zero-sector (unknown) and one-sector granularities are the same.  */
-	granularity = max(q->limits.discard_granularity >> 9, 1U);
-	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
-
-	/*
-	 * Ensure that max_discard_sectors is of the proper
-	 * granularity, so that requests stay aligned after a split.
-	 */
-	max_discard_sectors = min(q->limits.max_discard_sectors, UINT_MAX >> 9);
-	max_discard_sectors -= max_discard_sectors % granularity;
-	if (unlikely(!max_discard_sectors)) {
-		/* Avoid infinite loop below. Being cautious never hurts. */
-		return -EOPNOTSUPP;
-	}
-
-	if (flags & BLKDEV_DISCARD_SECURE) {
-		if (!blk_queue_secdiscard(q))
-			return -EOPNOTSUPP;
-		type |= REQ_SECURE;
-	}
-
-	atomic_set(&bb.done, 1);
-	bb.flags = 1 << BIO_UPTODATE;
-	bb.wait = &wait;
+	int type = REQ_WRITE | REQ_DISCARD | REQ_PRIO;
+	int ret;
 
 	blk_start_plug(&plug);
-	while (nr_sects) {
-		unsigned int req_sects;
-		sector_t end_sect, tmp;
-
-		bio = bio_alloc(gfp_mask, 1);
-		if (!bio) {
-			ret = -ENOMEM;
-			break;
-		}
-
-		req_sects = min_t(sector_t, nr_sects, max_discard_sectors);
-
-		/*
-		 * If splitting a request, and the next starting sector would be
-		 * misaligned, stop the discard at the previous aligned sector.
-		 */
-		end_sect = sector + req_sects;
-		tmp = end_sect;
-		if (req_sects < nr_sects &&
-		    sector_div(tmp, granularity) != alignment) {
-			end_sect = end_sect - alignment;
-			sector_div(end_sect, granularity);
-			end_sect = end_sect * granularity + alignment;
-			req_sects = end_sect - sector;
-		}
-
-		bio->bi_iter.bi_sector = sector;
-		bio->bi_end_io = bio_batch_end_io;
-		bio->bi_bdev = bdev;
-		bio->bi_private = &bb;
-
-		bio->bi_iter.bi_size = req_sects << 9;
-		nr_sects -= req_sects;
-		sector = end_sect;
-
-		atomic_inc(&bb.done);
-		submit_bio(type, bio);
-
-		/*
-		 * We can loop for a long time in here, if someone does
-		 * full device discards (like mkfs). Be nice and allow
-		 * us to schedule out to avoid softlocking if preempt
-		 * is disabled.
-		 */
-		cond_resched();
+	ret = __blkdev_issue_discard(bdev, sector, nr_sects, gfp_mask, flags,
+				     &bio);
+	if (!ret && bio) {
+		ret = submit_bio_wait(type, bio);
+		if (ret == -EOPNOTSUPP)
+			ret = 0;
+		bio_put(bio);
 	}
 	blk_finish_plug(&plug);
-
-	/* Wait for bios in-flight */
-	if (!atomic_dec_and_test(&bb.done))
-		wait_for_completion_io(&wait);
-
-	if (!test_bit(BIO_UPTODATE, &bb.flags))
-		ret = -EIO;
 
 	return ret;
 }

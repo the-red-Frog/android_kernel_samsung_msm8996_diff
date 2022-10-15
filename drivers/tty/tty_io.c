@@ -866,20 +866,16 @@ void disassociate_ctty(int on_exit)
 	spin_lock_irq(&current->sighand->siglock);
 	put_pid(current->signal->tty_old_pgrp);
 	current->signal->tty_old_pgrp = NULL;
-	tty = tty_kref_get(current->signal->tty);
-	spin_unlock_irq(&current->sighand->siglock);
 
+	tty = tty_kref_get(current->signal->tty);
 	if (tty) {
 		unsigned long flags;
-
-		tty_lock(tty);
 		spin_lock_irqsave(&tty->ctrl_lock, flags);
 		put_pid(tty->session);
 		put_pid(tty->pgrp);
 		tty->session = NULL;
 		tty->pgrp = NULL;
 		spin_unlock_irqrestore(&tty->ctrl_lock, flags);
-		tty_unlock(tty);
 		tty_kref_put(tty);
 	} else {
 #ifdef TTY_DEBUG_HANGUP
@@ -888,6 +884,7 @@ void disassociate_ctty(int on_exit)
 #endif
 	}
 
+	spin_unlock_irq(&current->sighand->siglock);
 	/* Now clear signal->tty under the lock */
 	read_lock(&tasklist_lock);
 	session_clear_tty(task_session(current));
@@ -2052,12 +2049,7 @@ retry_open:
 	}
 
 	if (tty) {
-		retval = tty_lock_interruptible(tty);
-		if (retval) {
-			if (retval == -EINTR)
-				retval = -ERESTARTSYS;
-			goto err_unref;
-		}
+		tty_lock(tty);
 		retval = tty_reopen(tty);
 		if (retval < 0) {
 			tty_unlock(tty);
@@ -2132,7 +2124,6 @@ retry_open:
 	return 0;
 err_unlock:
 	mutex_unlock(&tty_mutex);
-err_unref:
 	/* after locks to avoid deadlock */
 	if (!IS_ERR_OR_NULL(driver))
 		tty_driver_kref_put(driver);
@@ -2525,24 +2516,20 @@ static int tiocspgrp(struct tty_struct *tty, struct tty_struct *real_tty, pid_t 
 	struct pid *pgrp;
 	pid_t pgrp_nr;
 	int retval = tty_check_change(real_tty);
+	unsigned long flags;
 
 	if (retval == -EIO)
 		return -ENOTTY;
 	if (retval)
 		return retval;
-
+	if (!current->signal->tty ||
+	    (current->signal->tty != real_tty) ||
+	    (real_tty->session != task_session(current)))
+		return -ENOTTY;
 	if (get_user(pgrp_nr, p))
 		return -EFAULT;
 	if (pgrp_nr < 0)
 		return -EINVAL;
-
-	spin_lock_irq(&real_tty->ctrl_lock);
-	if (!current->signal->tty ||
-	    (current->signal->tty != real_tty) ||
-	    (real_tty->session != task_session(current))) {
-		retval = -ENOTTY;
-		goto out_unlock_ctrl;
-	}
 	rcu_read_lock();
 	pgrp = find_vpid(pgrp_nr);
 	retval = -ESRCH;
@@ -2552,12 +2539,12 @@ static int tiocspgrp(struct tty_struct *tty, struct tty_struct *real_tty, pid_t 
 	if (session_of_pgrp(pgrp) != task_session(current))
 		goto out_unlock;
 	retval = 0;
+	spin_lock_irqsave(&tty->ctrl_lock, flags);
 	put_pid(real_tty->pgrp);
 	real_tty->pgrp = get_pid(pgrp);
+	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
 out_unlock:
 	rcu_read_unlock();
-out_unlock_ctrl:
-	spin_unlock_irq(&real_tty->ctrl_lock);
 	return retval;
 }
 
@@ -2569,31 +2556,21 @@ out_unlock_ctrl:
  *
  *	Obtain the session id of the tty. If there is no session
  *	return an error.
+ *
+ *	Locking: none. Reference to current->signal->tty is safe.
  */
 
 static int tiocgsid(struct tty_struct *tty, struct tty_struct *real_tty, pid_t __user *p)
 {
-	unsigned long flags;
-	pid_t sid;
-
 	/*
 	 * (tty == real_tty) is a cheap way of
 	 * testing if the tty is NOT a master pty.
 	*/
 	if (tty == real_tty && current->signal->tty != real_tty)
 		return -ENOTTY;
-
-	spin_lock_irqsave(&real_tty->ctrl_lock, flags);
 	if (!real_tty->session)
-		goto err;
-	sid = pid_vnr(real_tty->session);
-	spin_unlock_irqrestore(&real_tty->ctrl_lock, flags);
-
-	return put_user(sid, p);
-
-err:
-	spin_unlock_irqrestore(&real_tty->ctrl_lock, flags);
-	return -ENOTTY;
+		return -ENOTTY;
+	return put_user(pid_vnr(real_tty->session), p);
 }
 
 /**
@@ -2688,14 +2665,14 @@ out:
  *	@p: pointer to result
  *
  *	Obtain the modem status bits from the tty driver if the feature
- *	is supported. Return -ENOTTY if it is not available.
+ *	is supported. Return -EINVAL if it is not available.
  *
  *	Locking: none (up to the driver)
  */
 
 static int tty_tiocmget(struct tty_struct *tty, int __user *p)
 {
-	int retval = -ENOTTY;
+	int retval = -EINVAL;
 
 	if (tty->ops->tiocmget) {
 		retval = tty->ops->tiocmget(tty);
@@ -2713,7 +2690,7 @@ static int tty_tiocmget(struct tty_struct *tty, int __user *p)
  *	@p: pointer to desired bits
  *
  *	Set the modem status bits from the tty driver if the feature
- *	is supported. Return -ENOTTY if it is not available.
+ *	is supported. Return -EINVAL if it is not available.
  *
  *	Locking: none (up to the driver)
  */
@@ -2725,7 +2702,7 @@ static int tty_tiocmset(struct tty_struct *tty, unsigned int cmd,
 	unsigned int set, clear, val;
 
 	if (tty->ops->tiocmset == NULL)
-		return -ENOTTY;
+		return -EINVAL;
 
 	retval = get_user(val, p);
 	if (retval)
@@ -2990,14 +2967,10 @@ void __do_SAK(struct tty_struct *tty)
 	struct task_struct *g, *p;
 	struct pid *session;
 	int		i;
-	unsigned long flags;
 
 	if (!tty)
 		return;
-
-	spin_lock_irqsave(&tty->ctrl_lock, flags);
-	session = get_pid(tty->session);
-	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
+	session = tty->session;
 
 	tty_ldisc_flush(tty);
 
@@ -3033,7 +3006,6 @@ void __do_SAK(struct tty_struct *tty)
 		task_unlock(p);
 	} while_each_thread(g, p);
 	read_unlock(&tasklist_lock);
-	put_pid(session);
 #endif
 }
 
@@ -3091,10 +3063,7 @@ struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
 
 	kref_init(&tty->kref);
 	tty->magic = TTY_MAGIC;
-	if (tty_ldisc_init(tty)) {
-		kfree(tty);
-		return NULL;
-	}
+	tty_ldisc_init(tty);
 	tty->session = NULL;
 	tty->pgrp = NULL;
 	mutex_init(&tty->legacy_mutex);

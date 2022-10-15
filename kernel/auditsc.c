@@ -72,9 +72,11 @@
 #include <linux/fs_struct.h>
 #include <linux/compat.h>
 #include <linux/ctype.h>
+#include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <uapi/linux/limits.h>
+#include <asm/unistd.h>
 
 #include "audit.h"
 
@@ -1113,7 +1115,7 @@ static void audit_log_execve_info(struct audit_context *context,
 		}
 
 		/* write as much as we can to the audit log */
-		if (len_buf >= 0) {
+		if (len_buf > 0) {
 			/* NOTE: some magic numbers here - basically if we
 			 *       can't fit a reasonable amount of data into the
 			 *       existing audit buffer, flush it and start with
@@ -1348,7 +1350,10 @@ static void audit_log_exit(struct audit_context *context, struct task_struct *ts
 
 	/* tsk == current */
 	context->personality = tsk->personality;
-
+	
+// [ SEC_SELINUX_PORTING_COMMON
+	if (context->major != __NR_setsockopt  && context->major != 294 ) {
+// ] SEC_SELINUX_PORTING_COMMON
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_SYSCALL);
 	if (!ab)
 		return;		/* audit_panic has been called */
@@ -1457,7 +1462,9 @@ static void audit_log_exit(struct audit_context *context, struct task_struct *ts
 	}
 
 	audit_log_proctitle(tsk, context);
-
+// [ SEC_SELINUX_PORTING_COMMON
+	} // End of context->major != __NR_setsockopt
+// ] SEC_SELINUX_PORTING_COMMON
 	/* Send end of event record to help user space know we are finished */
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_EOE);
 	if (ab)
@@ -2075,14 +2082,13 @@ static void audit_log_set_loginuid(kuid_t koldloginuid, kuid_t kloginuid,
 	if (!audit_enabled)
 		return;
 
-	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_LOGIN);
-	if (!ab)
-		return;
-
 	uid = from_kuid(&init_user_ns, task_uid(current));
 	oldloginuid = from_kuid(&init_user_ns, koldloginuid);
 	loginuid = from_kuid(&init_user_ns, kloginuid),
 
+	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_LOGIN);
+	if (!ab)
+		return;
 	audit_log_format(ab, "pid=%d uid=%u", task_tgid_nr(current), uid);
 	audit_log_task_context(ab);
 	audit_log_format(ab, " old-auid=%u auid=%u old-ses=%u ses=%u res=%d",
@@ -2340,9 +2346,10 @@ int __audit_signal_info(int sig, struct task_struct *t)
 				audit_sig_uid = uid;
 			security_task_getsecid(tsk, &audit_sig_sid);
 		}
-		if (!audit_signals || audit_dummy_context())
-			return 0;
 	}
+
+	if (!audit_signals || audit_dummy_context())
+		return 0;
 
 	/* optimize the common case by putting first signal recipient directly
 	 * in audit_context */

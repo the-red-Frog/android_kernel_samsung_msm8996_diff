@@ -38,8 +38,13 @@
 #include <linux/prefetch.h>
 #include <linux/ratelimit.h>
 #include <linux/list_lru.h>
+#include <linux/kasan.h>
+
 #include "internal.h"
 #include "mount.h"
+#ifdef CONFIG_RKP_NS_PROT
+u8 ns_prot = 0;
+#endif
 
 /*
  * Usage:
@@ -1300,11 +1305,8 @@ int d_set_mounted(struct dentry *dentry)
 	}
 	spin_lock(&dentry->d_lock);
 	if (!d_unlinked(dentry)) {
-		ret = -EBUSY;
-		if (!d_mountpoint(dentry)) {
-			dentry->d_flags |= DCACHE_MOUNTED;
-			ret = 0;
-		}
+		dentry->d_flags |= DCACHE_MOUNTED;
+		ret = 0;
 	}
  	spin_unlock(&dentry->d_lock);
 out:
@@ -1342,7 +1344,7 @@ static enum d_walk_ret select_collect(void *_data, struct dentry *dentry)
 		goto out;
 
 	if (dentry->d_flags & DCACHE_SHRINK_LIST) {
-		data->found++;
+		goto out;
 	} else {
 		if (dentry->d_flags & DCACHE_LRU_LIST)
 			d_lru_del(dentry);
@@ -1458,7 +1460,7 @@ static void check_and_drop(void *_data)
 {
 	struct detach_data *data = _data;
 
-	if (!data->mountpoint && list_empty(&data->select.dispose))
+	if (!data->mountpoint && !data->select.found)
 		__d_drop(data->select.start);
 }
 
@@ -1500,15 +1502,17 @@ void d_invalidate(struct dentry *dentry)
 
 		d_walk(dentry, &data, detach_and_collect, check_and_drop);
 
-		if (!list_empty(&data.select.dispose))
+		if (data.select.found)
 			shrink_dentry_list(&data.select.dispose);
-		else if (!data.mountpoint)
-			return;
 
 		if (data.mountpoint) {
 			detach_mounts(data.mountpoint);
 			dput(data.mountpoint);
 		}
+
+		if (!data.mountpoint && !data.select.found)
+			break;
+
 		cond_resched();
 	}
 }
@@ -1549,6 +1553,9 @@ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
 		}
 		atomic_set(&p->u.count, 1);
 		dname = p->name;
+		if (IS_ENABLED(CONFIG_DCACHE_WORD_ACCESS))
+			kasan_unpoison_shadow(dname,
+				round_up(name->len + 1,	sizeof(unsigned long)));
 	} else  {
 		dname = dentry->d_iname;
 	}	
@@ -1878,6 +1885,7 @@ void d_instantiate_new(struct dentry *entry, struct inode *inode)
 	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
 	BUG_ON(!inode);
 	lockdep_annotate_inode_mutex_key(inode);
+	security_d_instantiate(entry, inode);
 	spin_lock(&inode->i_lock);
 	__d_instantiate(entry, inode);
 	WARN_ON(!(inode->i_state & I_NEW));
@@ -1885,7 +1893,6 @@ void d_instantiate_new(struct dentry *entry, struct inode *inode)
 	smp_mb();
 	wake_up_bit(&inode->i_state, __I_NEW);
 	spin_unlock(&inode->i_lock);
-	security_d_instantiate(entry, inode);
 }
 EXPORT_SYMBOL(d_instantiate_new);
 
@@ -2970,7 +2977,11 @@ restart:
 			if (mnt != parent) {
 				dentry = ACCESS_ONCE(mnt->mnt_mountpoint);
 				mnt = parent;
+#ifdef CONFIG_RKP_NS_PROT
+				vfsmnt = mnt->mnt;
+#else
 				vfsmnt = &mnt->mnt;
+#endif
 				continue;
 			}
 			if (!error)
@@ -3061,6 +3072,7 @@ char *d_absolute_path(const struct path *path,
 		return ERR_PTR(error);
 	return res;
 }
+EXPORT_SYMBOL(d_absolute_path);
 
 /*
  * same as __d_path but appends "(deleted)" for unlinked files.
@@ -3501,6 +3513,9 @@ void __init vfs_caches_init(unsigned long mempages)
 	mnt_init();
 	bdev_cache_init();
 	chrdev_init();
+#ifdef CONFIG_RKP_NS_PROT
+	ns_prot = 1;
+#endif
 }
 
 void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry)

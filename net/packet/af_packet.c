@@ -584,8 +584,7 @@ static int prb_calc_retire_blk_tmo(struct packet_sock *po,
 			msec = 1;
 			div = speed / 1000;
 		}
-	} else
-		return DEFAULT_PRB_RETIRE_TOV;
+	}
 
 	mbits = (blk_size_in_bytes * 8) / (1024 * 1024);
 
@@ -1396,6 +1395,8 @@ static void __fanout_link(struct sock *sk, struct packet_sock *po)
 	f->arr[f->num_members] = sk;
 	smp_wmb();
 	f->num_members++;
+	if (f->num_members == 1)
+		dev_add_pack(&f->prot_hook);
 	spin_unlock(&f->lock);
 }
 
@@ -1412,6 +1413,8 @@ static void __fanout_unlink(struct sock *sk, struct packet_sock *po)
 	BUG_ON(i >= f->num_members);
 	f->arr[i] = f->arr[f->num_members - 1];
 	f->num_members--;
+	if (f->num_members == 0)
+		__dev_remove_pack(&f->prot_hook);
 	spin_unlock(&f->lock);
 }
 
@@ -1447,10 +1450,6 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
 
 	mutex_lock(&fanout_mutex);
 
-	err = -EINVAL;
-	if (!po->running)
-		goto out;
-
 	err = -EALREADY;
 	if (po->fanout)
 		goto out;
@@ -1484,7 +1483,6 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
 		match->prot_hook.func = packet_rcv_fanout;
 		match->prot_hook.af_packet_priv = match;
 		match->prot_hook.id_match = match_fanout_group;
-		dev_add_pack(&match->prot_hook);
 		list_add(&match->list, &fanout_list);
 	}
 	err = -EINVAL;
@@ -1515,7 +1513,14 @@ out:
 	return err;
 }
 
-static void fanout_release(struct sock *sk)
+/* If pkt_sk(sk)->fanout->sk_ref is zero, this function removes
+ * pkt_sk(sk)->fanout from fanout_list and returns pkt_sk(sk)->fanout.
+ * It is the responsibility of the caller to free the returned packet_fanout 
+ * (after synchronize_net())
+ * This Branch still does not have support classic BPF fanout mode.
+ *  upstream commit 47dceb8ecdc: packet: add classic BPF fanout mode
+ */
+static struct packet_fanout *fanout_release(struct sock *sk)
 {
 	struct packet_sock *po = pkt_sk(sk);
 	struct packet_fanout *f;
@@ -1525,13 +1530,15 @@ static void fanout_release(struct sock *sk)
 	if (f) {
 		po->fanout = NULL;
 
-		if (atomic_dec_and_test(&f->sk_ref)) {
+		if (atomic_dec_and_test(&f->sk_ref))
 			list_del(&f->list);
-			dev_remove_pack(&f->prot_hook);
-			kfree(f);
-		}
+		else
+			f = NULL;
+
 	}
 	mutex_unlock(&fanout_mutex);
+
+	return f;
 }
 
 static bool packet_extra_vlan_len_allowed(const struct net_device *dev,
@@ -1921,6 +1928,9 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
 		status |= TP_STATUS_CSUMNOTREADY;
 
+	if (skb->ip_summed == CHECKSUM_UNNECESSARY)
+		status |= TP_STATUS_CSUM_UNNECESSARY;
+
 	snaplen = skb->len;
 
 	res = run_filter(skb, sk, snaplen);
@@ -2266,13 +2276,6 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 
 	mutex_lock(&po->pg_vec_lock);
 
-	/* packet_sendmsg() check on tx_ring.pg_vec was lockless,
-	 * we need to confirm it under protection of pg_vec_lock.
-	 */
-	if (unlikely(!po->tx_ring.pg_vec)) {
-		err = -EBUSY;
-		goto out;
-	}
 	if (likely(saddr == NULL)) {
 		dev	= packet_cached_dev_get(po);
 		proto	= po->num;
@@ -2434,7 +2437,6 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
 	int vnet_hdr_len;
 	struct packet_sock *po = pkt_sk(sk);
 	unsigned short gso_type = 0;
-	bool has_vnet_hdr = false;
 	int hlen, tlen;
 	int extra_len = 0;
 
@@ -2516,7 +2518,6 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
 				goto out_unlock;
 
 		}
-		has_vnet_hdr = true;
 	}
 
 	if (unlikely(sock_flag(sk, SOCK_NOFCS))) {
@@ -2539,17 +2540,12 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
 	if (skb == NULL)
 		goto out_unlock;
 
-	skb_reset_network_header(skb);
+	skb_set_network_header(skb, reserve);
 
 	err = -EINVAL;
 	if (sock->type == SOCK_DGRAM &&
 	    (offset = dev_hard_header(skb, dev, ntohs(proto), addr, NULL, len)) < 0)
 		goto out_free;
-	else if (reserve) {
-		skb_reserve(skb, -reserve);
-		if (len < reserve)
-			skb_reset_network_header(skb);
-	}
 
 	/* Returns -EFAULT on error */
 	err = skb_copy_datagram_from_iovec(skb, offset, msg->msg_iov, 0, len);
@@ -2571,7 +2567,7 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
 
 	packet_pick_tx_queue(dev, skb);
 
-	if (has_vnet_hdr) {
+	if (po->has_vnet_hdr) {
 		if (vnet_hdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
 			if (!skb_partial_csum_set(skb, vnet_hdr.csum_start,
 						  vnet_hdr.csum_offset)) {
@@ -2633,6 +2629,7 @@ static int packet_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
 	struct packet_sock *po;
+	struct packet_fanout *f;
 	struct net *net;
 	union tpacket_req_u req_u;
 
@@ -2674,9 +2671,13 @@ static int packet_release(struct socket *sock)
 	}
 	release_sock(sk);
 
-	fanout_release(sk);
+	f = fanout_release(sk);
 
 	synchronize_net();
+
+	if (f)
+		kfree(f);
+
 	/*
 	 *	Now the socket is dead. No more input will appear.
 	 */
@@ -3028,28 +3029,19 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
 	sock_recv_ts_and_drops(msg, sk, skb);
 
 	if (msg->msg_name) {
-		int copy_len;
-
 		/* If the address length field is there to be filled
 		 * in, we fill it in now.
 		 */
 		if (sock->type == SOCK_PACKET) {
 			__sockaddr_check_size(sizeof(struct sockaddr_pkt));
 			msg->msg_namelen = sizeof(struct sockaddr_pkt);
-			copy_len = msg->msg_namelen;
 		} else {
 			struct sockaddr_ll *sll = &PACKET_SKB_CB(skb)->sa.ll;
 			msg->msg_namelen = sll->sll_halen +
 				offsetof(struct sockaddr_ll, sll_addr);
-			copy_len = msg->msg_namelen;
-			if (msg->msg_namelen < sizeof(struct sockaddr_ll)) {
-				memset(msg->msg_name +
-				       offsetof(struct sockaddr_ll, sll_addr),
-				       0, sizeof(sll->sll_addr));
-				msg->msg_namelen = sizeof(struct sockaddr_ll);
-			}
 		}
-		memcpy(msg->msg_name, &PACKET_SKB_CB(skb)->sa, copy_len);
+		memcpy(msg->msg_name, &PACKET_SKB_CB(skb)->sa,
+		       msg->msg_namelen);
 	}
 
 	if (pkt_sk(sk)->auxdata) {
@@ -3662,7 +3654,6 @@ static int packet_notifier(struct notifier_block *this,
 				}
 				if (msg == NETDEV_UNREGISTER) {
 					packet_cached_dev_reset(po);
-					fanout_release(sk);
 					po->ifindex = -1;
 					if (po->prot_hook.dev)
 						dev_put(po->prot_hook.dev);
@@ -3875,7 +3866,7 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
 
 	/* Opening a Tx-ring is NOT supported in TPACKET_V3 */
 	if (!closing && tx_ring && (po->tp_version > TPACKET_V2)) {
-		net_warn_ratelimited("Tx-ring is not supported.\n");
+		WARN(1, "Tx-ring is not supported.\n");
 		goto out;
 	}
 

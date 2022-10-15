@@ -63,8 +63,91 @@
 #include <uapi/linux/module.h>
 #include "module-internal.h"
 
+
+
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+#include <asm/tlbflush.h>
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/module.h>
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+#define TIMA_PAC_CMD_ID 0x3f80d221
+#define TIMA_SET_PTE_RO 1
+#define TIMA_SET_PTE_NX 2
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
+
+#ifdef CONFIG_TIMA_LKMAUTH
+#include <linux/qseecom.h>
+#include <linux/kobject.h>
+#include <linux/spinlock.h>
+
+#define CONFIG_LKMAUTH_SECONDWAY
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+#define LKM_MAGIC 0x1122334444332211
+#endif
+
+#define QSEECOM_ALIGN_SIZE  0x40
+#define QSEECOM_ALIGN_MASK  (QSEECOM_ALIGN_SIZE - 1)
+#define QSEECOM_ALIGN(x)    \
+    ((x + QSEECOM_ALIGN_SIZE) & (~QSEECOM_ALIGN_MASK))
+
+struct qseecom_handle {
+    void *dev; /* in/out */
+    unsigned char *sbuf; /* in/out */
+    uint32_t sbuf_len; /* in/out */
+};
+
+static struct qseecom_handle *qhandle = NULL;
+DEFINE_MUTEX(lkmauth_mutex);
+
+extern int qseecom_start_app(struct qseecom_handle **handle, char *app_name, uint32_t size);
+extern int qseecom_shutdown_app(struct qseecom_handle **handle);
+extern int qseecom_send_command(struct qseecom_handle *handle, void *send_buf, uint32_t sbuf_len, void *resp_buf, uint32_t rbuf_len);
+extern struct device *tima_uevent_dev;
+
+#define SVC_LKMAUTH_ID              0x00050000
+#define LKMAUTH_CREATE_CMD(x) (SVC_LKMAUTH_ID | x)
+
+#define MODULE_HASH_DIR "/system"
+#define MODULE_DIR "/system/lib/modules"
+
+#define HASH_ALGO QSEE_HASH_SHA1
+#define HASH_SIZE QSEE_SHA1_HASH_SZ
+
+/**
+ * Commands for TZ LKMAUTH application.
+ * */
+typedef enum
+{
+  LKMAUTH_CMD_AUTH        = LKMAUTH_CREATE_CMD(0x00000000),
+  LKMAUTH_CMD_UNKNOWN     = LKMAUTH_CREATE_CMD(0x7FFFFFFF)
+} lkmauth_cmd_type;
+
+/* Message types for every command - Add one here for every command you add */
+
+typedef struct lkmauth_req_s
+{
+  lkmauth_cmd_type cmd_id;
+  unsigned long long module_addr_start;
+  u32 module_len;
+  u32 min;
+  u32 max;
+  char module_name [280];
+  int module_name_len;
+} __attribute__ ((packed)) lkmauth_req_t;
+
+typedef struct lkmauth_rsp_s
+{
+  /** First 4 bytes should always be command id */
+  lkmauth_cmd_type cmd_id;
+  int ret;
+  union {
+    unsigned char hash[20];
+    char result_ondemand[256];
+  }  __attribute__ ((packed)) result;
+} __attribute__ ((packed)) lkmauth_rsp_t;
+#endif
 
 #ifndef ARCH_SHF_SMALL
 #define ARCH_SHF_SMALL 0
@@ -75,11 +158,15 @@
  * to ensure complete separation of code and data, but
  * only when CONFIG_DEBUG_SET_MODULE_RONX=y
  */
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+# define debug_align(X) ALIGN(X, PAGE_SIZE)
+#else
 #ifdef CONFIG_DEBUG_SET_MODULE_RONX
 # define debug_align(X) ALIGN(X, PAGE_SIZE)
 #else
 # define debug_align(X) (X)
 #endif
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
 
 /*
  * Given BASE and SIZE this macro calculates the number of pages the
@@ -867,8 +954,6 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 	strlcpy(last_unloaded_module, mod->name, sizeof(last_unloaded_module));
 
 	free_module(mod);
-	/* someone could wait for the module in add_unformed_module() */
-	wake_up_all(&module_wq);
 	return 0;
 out:
 	mutex_unlock(&module_mutex);
@@ -1618,6 +1703,7 @@ static int mod_sysfs_init(struct module *mod)
 	if (err)
 		mod_kobject_put(mod);
 
+	/* delay uevent until full sysfs population */
 out:
 	return err;
 }
@@ -1651,6 +1737,7 @@ static int mod_sysfs_setup(struct module *mod,
 	add_sect_attrs(mod, info);
 	add_notes_attrs(mod, info);
 
+	kobject_uevent(&mod->mkobj.kobj, KOBJ_ADD);
 	return 0;
 
 out_unreg_param:
@@ -1831,7 +1918,7 @@ static void unset_module_core_ro_nx(struct module *mod) { }
 static void unset_module_init_ro_nx(struct module *mod) { }
 #endif
 
-void __weak module_free(struct module *mod, void *module_region)
+void __weak module_memfree(void *module_region)
 {
 	vfree(module_region);
 }
@@ -1872,7 +1959,7 @@ static void free_module(struct module *mod)
 
 	/* This may be NULL, but that's OK */
 	unset_module_init_ro_nx(mod);
-	module_free(mod, mod->module_init);
+	module_memfree(mod->module_init);
 	kfree(mod->args);
 	percpu_modfree(mod);
 
@@ -1881,7 +1968,7 @@ static void free_module(struct module *mod)
 
 	/* Finally, free the core (containing the module structure) */
 	unset_module_core_ro_nx(mod);
-	module_free(mod, mod->module_core);
+	module_memfree(mod->module_core);
 
 #ifdef CONFIG_MPU
 	update_protections(current->mm);
@@ -1940,21 +2027,6 @@ static int verify_export_symbols(struct module *mod)
 	return 0;
 }
 
-static bool ignore_undef_symbol(Elf_Half emachine, const char *name)
-{
-	/*
-	 * On x86, PIC code and Clang non-PIC code may have call foo@PLT. GNU as
-	 * before 2.37 produces an unreferenced _GLOBAL_OFFSET_TABLE_ on x86-64.
-	 * i386 has a similar problem but may not deserve a fix.
-	 *
-	 * If we ever have to ignore many symbols, consider refactoring the code to
-	 * only warn if referenced by a relocation.
-	 */
-	if (emachine == EM_386 || emachine == EM_X86_64)
-		return !strcmp(name, "_GLOBAL_OFFSET_TABLE_");
-	return false;
-}
-
 /* Change all symbols so that st_value encodes the pointer directly. */
 static int simplify_symbols(struct module *mod, const struct load_info *info)
 {
@@ -1996,10 +2068,8 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 				break;
 			}
 
-			/* Ok if weak or ignored.  */
-			if (!ksym &&
-			    (ELF_ST_BIND(sym[i].st_info) == STB_WEAK ||
-			     ignore_undef_symbol(info->hdr->e_machine, name)))
+			/* Ok if weak.  */
+			if (!ksym && ELF_ST_BIND(sym[i].st_info) == STB_WEAK)
 				break;
 
 			pr_warn("%s: Unknown symbol %s (err %li)\n",
@@ -2254,7 +2324,7 @@ static char elf_type(const Elf_Sym *sym, const struct load_info *info)
 	}
 	if (sym->st_shndx == SHN_UNDEF)
 		return 'U';
-	if (sym->st_shndx == SHN_ABS || sym->st_shndx == info->index.pcpu)
+	if (sym->st_shndx == SHN_ABS)
 		return 'a';
 	if (sym->st_shndx >= SHN_LORESERVE)
 		return '?';
@@ -2283,7 +2353,7 @@ static char elf_type(const Elf_Sym *sym, const struct load_info *info)
 }
 
 static bool is_core_symbol(const Elf_Sym *src, const Elf_Shdr *sechdrs,
-			   unsigned int shnum, unsigned int pcpundx)
+                           unsigned int shnum)
 {
 	const Elf_Shdr *sec;
 
@@ -2291,11 +2361,6 @@ static bool is_core_symbol(const Elf_Sym *src, const Elf_Shdr *sechdrs,
 	    || src->st_shndx >= shnum
 	    || !src->st_name)
 		return false;
-
-#ifdef CONFIG_KALLSYMS_ALL
-	if (src->st_shndx == pcpundx)
-		return true;
-#endif
 
 	sec = sechdrs + src->st_shndx;
 	if (!(sec->sh_flags & SHF_ALLOC)
@@ -2334,8 +2399,7 @@ static void layout_symtab(struct module *mod, struct load_info *info)
 	/* Compute total space required for the core symbols' strtab. */
 	for (ndst = i = 0; i < nsrc; i++) {
 		if (i == 0 ||
-		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum,
-				   info->index.pcpu)) {
+		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum)) {
 			strtab_size += strlen(&info->strtab[src[i].st_name])+1;
 			ndst++;
 		}
@@ -2392,8 +2456,7 @@ static void add_kallsyms(struct module *mod, const struct load_info *info)
 	src = mod->kallsyms->symtab;
 	for (ndst = i = 0; i < mod->kallsyms->num_symtab; i++) {
 		if (i == 0 ||
-		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum,
-				   info->index.pcpu)) {
+		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum)) {
 			dst[ndst] = src[i];
 			dst[ndst++].st_name = s - mod->core_kallsyms.strtab;
 			s += strlcpy(s, &mod->kallsyms->strtab[src[i].st_name],
@@ -2411,6 +2474,194 @@ static void add_kallsyms(struct module *mod, const struct load_info *info)
 {
 }
 #endif /* CONFIG_KALLSYMS */
+#ifdef	CONFIG_TIMA_LKMAUTH
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+static DEFINE_SPINLOCK(lkm_va_to_pa_lock);
+#endif
+extern pid_t pid_from_lkm;
+#define LKMAUTH_RETRY_CNT 5
+int qseecom_set_bandwidth(struct qseecom_handle *handle, bool high);
+static int lkmauth(Elf_Ehdr *hdr, int len, int cnt)
+{
+	int ret = 0; /* value to be returned for lkmauth */
+	int qsee_ret = 0; /* value used to capture qsee return state */
+	char *envp[3], *status, *result;
+	char app_name[MAX_APP_NAME_SIZE];
+	lkmauth_req_t *kreq = NULL;
+	lkmauth_rsp_t *krsp = NULL;
+	int req_len = 0, rsp_len = 0;
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+	unsigned long long par;
+	unsigned long long virt_addr;
+	unsigned long long *pBuf = NULL;
+	unsigned long long *ptr;
+	unsigned int size;
+	unsigned long flags;
+#endif
+	mutex_lock(&lkmauth_mutex);
+	pr_warn("TIMA: lkmauth--launch the tzapp to check kernel module; module len is %d\n", len);
+
+	snprintf(app_name, MAX_APP_NAME_SIZE, "%s", "tima_lkm");
+
+	if ( NULL == qhandle ) {
+		/* start the lkmauth tzapp only when it is not loaded. */
+		qsee_ret = qseecom_start_app(&qhandle, app_name, 1024);
+	}
+	if ( NULL == qhandle ) {
+		/* qhandle is still NULL. It seems we couldn't start lkmauth tzapp. */
+		pr_err("TIMA: lkmauth--cannot get tzapp handle from kernel.\n");
+		ret = -1; /* lkm authentication failed. */
+		goto lkmauth_ret; /* leave the function now. */
+	}
+	if (qsee_ret) {
+		/* Another way for lkmauth tzapp loading to fail. */
+		pr_err("TIMA: lkmauth--cannot load tzapp from kernel; qsee_ret =  %d.\n", qsee_ret);
+		qhandle = NULL; /* Do we have a memory leak this way? */
+		ret = -1; /* lkm authentication failed. */
+		goto lkmauth_ret; /* leave the function now. */
+	}
+
+	/* Generate the request cmd to verify hash of ko.
+	 * Note that we are reusing the same buffer for both request and response,
+	 * and the buffer is allocated in qhandle.
+	 */
+	kreq = (struct lkmauth_req_s *)qhandle->sbuf;
+	kreq->cmd_id = LKMAUTH_CMD_AUTH;
+#ifdef CONFIG_64BIT
+	pr_warn("TIMA: lkmauth -- hdr before kreq is : %lx\n", (unsigned long)hdr);
+	kreq->module_len = len;
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+	virt_addr = (unsigned long)hdr;
+	size = ((len/PAGE_SIZE) + 2)*sizeof(pBuf);
+	pBuf = kmalloc(size, GFP_KERNEL);
+
+	if (pBuf == NULL) {
+		printk("lkmauth: failed to allocate memory %d \n", size);
+		goto lkmauth_ret;
+	}
+	ptr = pBuf;
+	*ptr = LKM_MAGIC;
+	ptr++;
+	do {
+		spin_lock_irqsave(&lkm_va_to_pa_lock, flags);
+		__asm__	("at s1e1r, %1\n"
+		"mrs %0, par_el1\n"
+		:"=r"(par):"r"(virt_addr));
+		spin_unlock_irqrestore(&lkm_va_to_pa_lock, flags);
+		if(par & 0x1) {
+			printk("TIMA: lkmauth failed to translate va: %llx \n", virt_addr);
+			goto lkmauth_ret;
+		}
+		//fix last 12 bits
+		*ptr = (unsigned long long)(par & PAGE_MASK);
+		len = len - PAGE_SIZE;
+		virt_addr = virt_addr + PAGE_SIZE;
+		ptr++;
+	} while (len > 0);
+	kreq->module_addr_start = (unsigned long long)(virt_to_phys(pBuf));
+#else
+	kreq->module_addr_start = (unsigned long)hdr;
+#endif
+#else
+	pr_warn("TIMA: lkmauth -- hdr before kreq is : %x\n", (u32)hdr);
+	kreq->module_addr_start = (u32)hdr;
+	kreq->module_len = len;
+#endif
+
+	req_len = sizeof(lkmauth_req_t);
+	if (req_len & QSEECOM_ALIGN_MASK)
+		req_len = QSEECOM_ALIGN(req_len);
+
+	/* prepare the response buffer */
+	krsp =(struct lkmauth_rsp_s *)(qhandle->sbuf + req_len);
+
+	rsp_len = sizeof(lkmauth_rsp_t);
+	if (rsp_len & QSEECOM_ALIGN_MASK)
+		rsp_len = QSEECOM_ALIGN(rsp_len);
+
+#ifdef CONFIG_64BIT
+	pr_warn("TIMA: lkmauth--send cmd (%s) cmdlen(%lx:%d), rsplen(%lx:%d) id 0x%08X, \
+                req (0x%16lX), rsp(0x%16lX), module_start_addr(0x%16llx) module_len %d\n", \
+		app_name, sizeof(lkmauth_req_t), req_len, sizeof(lkmauth_rsp_t), rsp_len, \
+		kreq->cmd_id, (unsigned long)kreq, (unsigned long)krsp, kreq->module_addr_start, kreq->module_len);
+#else
+	pr_warn("TIMA: lkmauth--send cmd (%s) cmdlen(%d:%d), rsplen(%d:%d) id 0x%08X, \
+                req (0x%08X), rsp(0x%08X), module_start_addr(0x%08X) module_len %d\n", \
+		app_name, sizeof(lkmauth_req_t), req_len, sizeof(lkmauth_rsp_t), rsp_len, \
+		kreq->cmd_id, (int)kreq, (int)krsp, kreq->module_addr_start, kreq->module_len);
+#endif
+
+	qseecom_set_bandwidth(qhandle, true);
+	pid_from_lkm = current->pid;
+	qsee_ret = qseecom_send_command(qhandle, kreq, req_len, krsp, rsp_len);
+	pid_from_lkm = -1;
+	qseecom_set_bandwidth(qhandle, false);
+
+	if (qsee_ret) {
+		pr_err("TIMA: lkmauth--failed to send cmd to qseecom; qsee_ret = %d.\n", qsee_ret);
+		pr_warn("TIMA: lkmauth--shutting down the tzapp.\n");
+		qsee_ret = qseecom_shutdown_app(&qhandle);
+		if ( qsee_ret ) {
+			/* Failed to shut down the lkmauth tzapp. What will happen to
+			 * the qhandle in this case? Can it be used for the next lkmauth
+			 * invocation?
+			 */
+			pr_err("TIMA: lkmauth--failed to shut down the tzapp.\n");
+		}
+		else
+			qhandle = NULL;
+
+		ret = -1;
+		goto lkmauth_ret;
+	}
+
+	/* parse result */
+	if (krsp->ret == 0) {
+		pr_warn("TIMA: lkmauth--verification succeeded.\n");
+		ret = 0; /* ret should already be 0 before the assignment. */
+	} else {
+
+		pr_err("TIMA: lkmauth--verification failed %d\n", krsp->ret);
+		ret = -1;
+
+		/* Send a notification through uevent. Note that the lkmauth tzapp
+		 * should have already raised an alert in TZ Security log.
+		 */
+		status = kzalloc(16, GFP_KERNEL);
+		if (!status) {
+			pr_err("TIMA: lkmauth--%s kmalloc failed.\n", __func__);
+			goto lkmauth_ret;
+		}
+		snprintf(status , 16 , "TIMA_STATUS=%d", ret);
+		envp[0] = status;
+
+		result = kzalloc(256, GFP_KERNEL);
+		if (!result) {
+			pr_err("TIMA: lkmauth--%s kmalloc failed.\n", __func__);
+			kfree(envp[0]);
+			goto lkmauth_ret;
+		}
+		snprintf(result , 256, "TIMA_RESULT=%s", krsp->result.result_ondemand);
+		pr_warn("TIMA: %s result (%s) \n", krsp->result.result_ondemand, result);
+		envp[1] = result;
+		envp[2] = NULL;
+
+		if( cnt == (LKMAUTH_RETRY_CNT - 1) )
+			kobject_uevent_env(&tima_uevent_dev->kobj, KOBJ_CHANGE, envp);
+
+		kfree(envp[0]);
+		kfree(envp[1]);
+	}
+
+ lkmauth_ret:
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+	if(pBuf)
+		kfree(pBuf);
+#endif
+	mutex_unlock(&lkmauth_mutex);
+	return ret;
+}
+#endif
 
 static void dynamic_debug_setup(struct _ddebug *debug, unsigned int num)
 {
@@ -2450,7 +2701,13 @@ static void *module_alloc_update_bounds(unsigned long size)
 	return ret;
 }
 
-#ifdef CONFIG_DEBUG_KMEMLEAK
+#if defined(CONFIG_DEBUG_KMEMLEAK) && defined(CONFIG_DEBUG_MODULE_SCAN_OFF)
+static void kmemleak_load_module(const struct module *mod,
+				 const struct load_info *info)
+{
+	kmemleak_no_scan(mod->module_core);
+}
+#elif defined(CONFIG_DEBUG_KMEMLEAK)
 static void kmemleak_load_module(const struct module *mod,
 				 const struct load_info *info)
 {
@@ -2515,8 +2772,18 @@ static int module_sig_check(struct load_info *info, int flags)
 #endif /* !CONFIG_MODULE_SIG */
 
 /* Sanity checks against invalid binaries, wrong arch, weird elf version. */
+#ifdef CONFIG_TIMA_LKMAUTH
+static int elf_header_check(struct load_info *info, unsigned long module_len)
+#else
 static int elf_header_check(struct load_info *info)
+#endif
 {
+#ifdef CONFIG_TIMA_LKMAUTH
+	int i;
+#ifdef CONFIG_LKMAUTH_DEBUG
+	struct module *mod;
+#endif
+#endif
 	if (info->len < sizeof(*(info->hdr)))
 		return -ENOEXEC;
 
@@ -2530,7 +2797,22 @@ static int elf_header_check(struct load_info *info)
 	    || (info->hdr->e_shnum * sizeof(Elf_Shdr) >
 		info->len - info->hdr->e_shoff))
 		return -ENOEXEC;
-
+#ifdef CONFIG_TIMA_LKMAUTH
+#ifdef CONFIG_LKMAUTH_DEBUG
+	info->index.mod = find_sec(info, ".gnu.linkonce.this_module");
+	info->sechdrs = (void *)info->hdr + info->hdr->e_shoff;
+	mod = (void *)info->sechdrs[info->index.mod].sh_addr;
+	printk("TIMA: lkmauth - checking %s\n", mod->name);
+#endif
+	if (lkmauth(info->hdr, module_len, 0) != 0) {
+		for (i=0; i<LKMAUTH_RETRY_CNT; i++) {
+			if (lkmauth(info->hdr, module_len, i) == 0)
+				goto success;
+		}
+		return -ENOEXEC;
+	}
+success:
+#endif
 	return 0;
 }
 
@@ -2716,15 +2998,6 @@ static struct module *setup_load_info(struct load_info *info, int flags)
 	return mod;
 }
 
-static void check_modinfo_retpoline(struct module *mod, struct load_info *info)
-{
-	if (retpoline_module_ok(get_modinfo(info, "retpoline")))
-		return;
-
-	pr_warn("%s: loading module not compiled with retpoline compiler.\n",
-		mod->name);
-}
-
 static int check_modinfo(struct module *mod, struct load_info *info, int flags)
 {
 	const char *modmagic = get_modinfo(info, "vermagic");
@@ -2744,14 +3017,8 @@ static int check_modinfo(struct module *mod, struct load_info *info, int flags)
 		return -ENOEXEC;
 	}
 
-	if (!get_modinfo(info, "intree")) {
-		if (!test_taint(TAINT_OOT_MODULE))
-			pr_warn("%s: loading out-of-tree module taints kernel.\n",
-				mod->name);
+	if (!get_modinfo(info, "intree"))
 		add_taint_module(mod, TAINT_OOT_MODULE, LOCKDEP_STILL_OK);
-	}
-
-	check_modinfo_retpoline(mod, info);
 
 	if (get_modinfo(info, "staging")) {
 		add_taint_module(mod, TAINT_CRAP, LOCKDEP_STILL_OK);
@@ -2877,7 +3144,7 @@ static int move_module(struct module *mod, struct load_info *info)
 		 */
 		kmemleak_ignore(ptr);
 		if (!ptr) {
-			module_free(mod, mod->module_core);
+			module_memfree(mod->module_core);
 			return -ENOMEM;
 		}
 		memset(ptr, 0, mod->init_size);
@@ -2913,8 +3180,6 @@ static int move_module(struct module *mod, struct load_info *info)
 
 static int check_module_license_and_versions(struct module *mod)
 {
-	int prev_taint = test_taint(TAINT_PROPRIETARY_MODULE);
-
 	/*
 	 * ndiswrapper is under GPL by itself, but loads proprietary modules.
 	 * Don't use add_taint_module(), as it would prevent ndiswrapper from
@@ -2932,9 +3197,6 @@ static int check_module_license_and_versions(struct module *mod)
 	if (strcmp(mod->name, "lve") == 0)
 		add_taint_module(mod, TAINT_PROPRIETARY_MODULE,
 				 LOCKDEP_NOW_UNRELIABLE);
-
-	if (!prev_taint && test_taint(TAINT_PROPRIETARY_MODULE))
-		pr_warn("%s: module license taints kernel.\n", mod->name);
 
 #ifdef CONFIG_MODVERSIONS
 	if ((mod->num_syms && !mod->crcs)
@@ -3027,8 +3289,8 @@ static struct module *layout_and_allocate(struct load_info *info, int flags)
 static void module_deallocate(struct module *mod, struct load_info *info)
 {
 	percpu_modfree(mod);
-	module_free(mod, mod->module_init);
-	module_free(mod, mod->module_core);
+	module_memfree(mod->module_init);
+	module_memfree(mod->module_core);
 }
 
 int __weak module_finalize(const Elf_Ehdr *hdr,
@@ -3062,7 +3324,8 @@ static bool finished_loading(const char *name)
 
 	mutex_lock(&module_mutex);
 	mod = find_module_all(name, strlen(name), true);
-	ret = !mod || mod->state == MODULE_STATE_LIVE;
+	ret = !mod || mod->state == MODULE_STATE_LIVE
+		|| mod->state == MODULE_STATE_GOING;
 	mutex_unlock(&module_mutex);
 
 	return ret;
@@ -3078,33 +3341,172 @@ static void do_mod_ctors(struct module *mod)
 		mod->ctors[i]();
 #endif
 }
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+
+#ifndef TIMA_KERNEL_L1_MANAGE
+static inline pmd_t *tima_pmd_off_k(unsigned long virt)
+{
+		return pmd_offset(pud_offset(pgd_offset_k(virt), virt), virt);
+}
+
+void tima_set_pte_val(unsigned long virt,int numpages,int flags)
+{
+        unsigned long start = virt;
+        unsigned long end   = virt + (numpages << PAGE_SHIFT);
+        unsigned long pmd_end;
+        pmd_t *pmd;
+        pte_t *pte;
+
+        while (virt < end)
+        {
+                pmd =tima_pmd_off_k(virt);
+                pmd_end = min(ALIGN(virt + 1, PMD_SIZE), end);
+
+                if ((pmd_val(*pmd) & PMD_TYPE_MASK) != PMD_TYPE_TABLE) {
+                        //printk("Not a pagetable\n");
+                        virt = pmd_end;
+                        continue;
+                }
+
+                while (virt < pmd_end)
+                {
+                        pte = pte_offset_kernel(pmd, virt);
+                        if(flags == TIMA_SET_PTE_RO)
+                        {
+                                /*Make pages readonly*/
+                                ptep_set_wrprotect(current->mm, virt,pte);
+                        }
+                        if(flags == TIMA_SET_PTE_NX)
+                        {
+                                /*Make pages Non Executable*/
+                                ptep_set_nxprotect(current->mm, virt,pte);
+                        }
+                        virt += PAGE_SIZE;
+                }
+        }
+
+        flush_tlb_kernel_range(start, end);
+}
+#endif
+#ifdef  TIMA_KERNEL_L1_MANAGE
+void tima_mod_send_smc_instruction(unsigned int    *vatext,unsigned int    *vadata,unsigned int text_count,unsigned int data_count)
+{
+        unsigned long   cmd_id = TIMA_PAC_CMD_ID;
+  /*Call SMC instruction*/
+#if __GNUC__ >= 4 && __GNUC_MINOR__ >= 6
+	__asm__ __volatile__(".arch_extension sec\n");
+#endif
+        __asm__ __volatile__ (
+                        "stmfd  sp!,{r0-r4,r11}\n"
+                        "mov    r11, r0\n"
+                        "mov    r0, %0\n"
+                        "mov    r1, %1\n"
+                        "mov    r2, %2\n"
+                        "mov    r3, %3\n"
+                        "mov    r4, %4\n"
+                        "smc    #11\n"
+                        "mov    r6, #0\n"
+                        "pop    {r0-r4,r11}\n"
+                        "mcr    p15, 0, r6, c8, c3, 0\n"
+                        "dsb\n"
+                        "isb\n"
+                        ::"r"(cmd_id),"r"(vatext),"r"(text_count),"r"(vadata),"r"(data_count):"r0","r1","r2","r3","r4","r11","cc");
+
+}
+#endif
+/**
+ *    tima_mod_page_change_access  - Wrapper function to change access control permissions of pages
+ *
+ *     It sends code and data pages to secure side to  make code pages readonly and data pages non executable
+ *
+ */
+
+void tima_mod_page_change_access(struct module *mod)
+{
+        unsigned int    *vatext,*vadata;/* base virtual address of text and data regions*/
+        unsigned int    text_count,data_count;/* Number of text and data pages present in core section */
+	/*Lets first pickup core section */
+        vatext      = mod->module_core;
+        vadata      = (int *)((char *)(mod->module_core) + mod->core_ro_size);
+        text_count  = ((char *)vadata - (char *)vatext);
+        data_count  = debug_align(mod->core_size) - text_count;
+        text_count  = text_count / PAGE_SIZE;
+        data_count  = data_count / PAGE_SIZE;
+
+        /*Should be atleast a page */
+        if(!text_count)
+                text_count = 1;
+        if(!data_count)
+                data_count = 1;
+#ifdef  TIMA_KERNEL_L1_MANAGE
+        /* Change permissive bits for core section*/
+        tima_mod_send_smc_instruction(vatext,vadata,text_count,data_count);
+#else
+ /* Change permissive bits for core section and making Code read only, Data Non Executable*/
+        tima_set_pte_val( (unsigned long)vatext,text_count,TIMA_SET_PTE_RO);
+        tima_set_pte_val( (unsigned long)vadata,data_count,TIMA_SET_PTE_NX);
+#endif/*TIMA_KERNEL_L1_MANAGE*/
+
+     /*Lets pickup init section */
+        vatext      = mod->module_init;
+        vadata      = (int *)((char *)(mod->module_init) + mod->init_ro_size);
+        text_count  = ((char *)vadata - (char *)vatext);
+        data_count  = debug_align(mod->init_size) - text_count;
+        text_count  = text_count / PAGE_SIZE;
+        data_count  = data_count / PAGE_SIZE;
+
+#ifdef  TIMA_KERNEL_L1_MANAGE
+        /* Change permissive bits for init section*/
+        tima_mod_send_smc_instruction(vatext,vadata,text_count,data_count);
+#else
+/* Change permissive bits for init section and making Code read only,Data Non Executable*/
+        tima_set_pte_val( (unsigned long)vatext,text_count,TIMA_SET_PTE_RO);
+        tima_set_pte_val( (unsigned long)vadata,data_count,TIMA_SET_PTE_NX);
+#endif/*TIMA_KERNEL_L1_MANAGE*/
+}
+
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
+
+/* For freeing module_init on success, in case kallsyms traversing */
+struct mod_initfree {
+	struct rcu_head rcu;
+	void *module_init;
+};
+
+static void do_free_init(struct rcu_head *head)
+{
+	struct mod_initfree *m = container_of(head, struct mod_initfree, rcu);
+	module_memfree(m->module_init);
+	kfree(m);
+}
 
 /* This is where the real work happens */
 static int do_init_module(struct module *mod)
 {
 	int ret = 0;
+	struct mod_initfree *freeinit;
+
+	freeinit = kmalloc(sizeof(*freeinit), GFP_KERNEL);
+	if (!freeinit) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	freeinit->module_init = mod->module_init;
 
 	/*
 	 * We want to find out whether @mod uses async during init.  Clear
 	 * PF_USED_ASYNC.  async_schedule*() will set it.
 	 */
 	current->flags &= ~PF_USED_ASYNC;
-
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+    tima_mod_page_change_access(mod);
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
 	do_mod_ctors(mod);
 	/* Start the module */
 	if (mod->init != NULL)
 		ret = do_one_initcall(mod->init);
 	if (ret < 0) {
-		/* Init routine failed: abort.  Try to protect us from
-                   buggy refcounters. */
-		mod->state = MODULE_STATE_GOING;
-		synchronize_sched();
-		module_put(mod);
-		blocking_notifier_call_chain(&module_notify_list,
-					     MODULE_STATE_GOING, mod);
-		free_module(mod);
-		wake_up_all(&module_wq);
-		return ret;
+		goto fail_free_freeinit;
 	}
 	if (ret > 0) {
 		pr_warn("%s: '%s'->init suspiciously returned %d, it should "
@@ -3118,9 +3520,6 @@ static int do_init_module(struct module *mod)
 	mod->state = MODULE_STATE_LIVE;
 	blocking_notifier_call_chain(&module_notify_list,
 				     MODULE_STATE_LIVE, mod);
-
-	/* Delay uevent until module has finished its init routine */
-	kobject_uevent(&mod->mkobj.kobj, KOBJ_ADD);
 
 	/*
 	 * We need to finish all async code before the module init sequence
@@ -3139,7 +3538,7 @@ static int do_init_module(struct module *mod)
 	 *
 	 * http://thread.gmane.org/gmane.linux.kernel/1420814
 	 */
-	if (current->flags & PF_USED_ASYNC)
+	if (!mod->async_probe_requested && (current->flags & PF_USED_ASYNC))
 		async_synchronize_full();
 
 	mutex_lock(&module_mutex);
@@ -3151,15 +3550,33 @@ static int do_init_module(struct module *mod)
 	rcu_assign_pointer(mod->kallsyms, &mod->core_kallsyms);
 #endif
 	unset_module_init_ro_nx(mod);
-	module_free(mod, mod->module_init);
 	mod->module_init = NULL;
 	mod->init_size = 0;
 	mod->init_ro_size = 0;
 	mod->init_text_size = 0;
+	/*
+	 * We want to free module_init, but be aware that kallsyms may be
+	 * walking this with preempt disabled.  In all the failure paths,
+	 * we call synchronize_rcu/synchronize_sched, but we don't want
+	 * to slow down the success path, so use actual RCU here.
+	 */
+	call_rcu(&freeinit->rcu, do_free_init);
 	mutex_unlock(&module_mutex);
 	wake_up_all(&module_wq);
 
 	return 0;
+fail_free_freeinit:
+	kfree(freeinit);
+fail:
+	/* Try to protect us from buggy refcounters. */
+	mod->state = MODULE_STATE_GOING;
+	synchronize_sched();
+	module_put(mod);
+	blocking_notifier_call_chain(&module_notify_list,
+		MODULE_STATE_GOING, mod);
+	free_module(mod);
+	wake_up_all(&module_wq);
+	return ret;
 }
 
 static int may_init_module(void)
@@ -3186,7 +3603,8 @@ again:
 	mutex_lock(&module_mutex);
 	old = find_module_all(mod->name, strlen(mod->name), true);
 	if (old != NULL) {
-		if (old->state != MODULE_STATE_LIVE) {
+		if (old->state == MODULE_STATE_COMING
+		    || old->state == MODULE_STATE_UNFORMED) {
 			/* Wait in case it fails to load. */
 			mutex_unlock(&module_mutex);
 			err = wait_event_interruptible(module_wq,
@@ -3247,10 +3665,18 @@ out:
 	return err;
 }
 
-static int unknown_module_param_cb(char *param, char *val, const char *modname)
+static int unknown_module_param_cb(char *param, char *val, const char *modname,
+				   void *arg)
 {
-	/* Check for magic 'dyndbg' arg */ 
-	int ret = ddebug_dyndbg_module_param_cb(param, val, modname);
+	struct module *mod = arg;
+	int ret;
+
+	if (strcmp(param, "async_probe") == 0) {
+		mod->async_probe_requested = true;
+		return 0;
+	}
+	/* Check for magic 'dyndbg' arg */
+	ret = ddebug_dyndbg_module_param_cb(param, val, modname);
 	if (ret != 0)
 		pr_warn("%s: unknown parameter '%s' ignored\n", modname, param);
 	return 0;
@@ -3264,12 +3690,19 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	struct module *mod;
 	long err;
 	char *after_dashes;
+#ifdef CONFIG_TIMA_LKMAUTH
+	unsigned long module_len = info->len;
+#endif
 
 	err = module_sig_check(info, flags);
 	if (err)
 		goto free_copy;
 
+#ifdef CONFIG_TIMA_LKMAUTH
+	err = elf_header_check(info, module_len);
+#else
 	err = elf_header_check(info);
+#endif
 	if (err)
 		goto free_copy;
 
@@ -3352,7 +3785,8 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* Module is ready to execute: parsing args may do that. */
 	after_dashes = parse_args(mod->name, mod->args, mod->kp, mod->num_kp,
-				  -32768, 32767, unknown_module_param_cb);
+				  -32768, 32767, NULL,
+				  unknown_module_param_cb);
 	if (IS_ERR(after_dashes)) {
 		err = PTR_ERR(after_dashes);
 		goto bug_cleanup;
@@ -3375,7 +3809,6 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	return do_init_module(mod);
 
  bug_cleanup:
-	mod->state = MODULE_STATE_GOING;
 	/* module_bug_cleanup needs module_mutex protection */
 	mutex_lock(&module_mutex);
 	module_bug_cleanup(mod);

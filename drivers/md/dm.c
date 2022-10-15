@@ -1024,7 +1024,7 @@ static void free_rq_clone(struct request *clone)
  * Complete the clone and the original request.
  * Must be called without queue lock.
  */
-static void dm_end_request(struct request *clone, int error)
+void dm_end_request(struct request *clone, int error)
 {
 	int rw = rq_data_dir(clone);
 	struct dm_rq_target_io *tio = clone->end_io_data;
@@ -1427,13 +1427,13 @@ static void clone_bio(struct dm_target_io *tio, struct bio *bio,
 }
 
 static struct dm_target_io *alloc_tio(struct clone_info *ci,
-				      struct dm_target *ti,
+				      struct dm_target *ti, int nr_iovecs,
 				      unsigned target_bio_nr)
 {
 	struct dm_target_io *tio;
 	struct bio *clone;
 
-	clone = bio_alloc_bioset(GFP_NOIO, 0, ci->md->bs);
+	clone = bio_alloc_bioset(GFP_NOIO, nr_iovecs, ci->md->bs);
 	tio = container_of(clone, struct dm_target_io, clone);
 
 	tio->io = ci->io;
@@ -1447,12 +1447,18 @@ static void __clone_and_map_simple_bio(struct clone_info *ci,
 				       struct dm_target *ti,
 				       unsigned target_bio_nr, unsigned *len)
 {
-	struct dm_target_io *tio = alloc_tio(ci, ti, target_bio_nr);
+	struct dm_target_io *tio = alloc_tio(ci, ti, ci->bio->bi_max_vecs,
+							target_bio_nr);
 	struct bio *clone = &tio->clone;
 
 	tio->len_ptr = len;
 
-	__bio_clone_fast(clone, ci->bio);
+	/*
+	 * Discard requests require the bio's inline iovecs be initialized.
+	 * ci->bio->bi_max_vecs is BIO_INLINE_VECS anyway, for both flush
+	 * and discard, so no need for concern about wasted bvec allocations.
+	 */
+	 __bio_clone_fast(clone, ci->bio);
 	if (len)
 		bio_setup_sector(clone, ci->sector, *len);
 
@@ -1495,7 +1501,7 @@ static void __clone_and_map_data_bio(struct clone_info *ci, struct dm_target *ti
 		num_target_bios = ti->num_write_bios(ti, bio);
 
 	for (target_bio_nr = 0; target_bio_nr < num_target_bios; target_bio_nr++) {
-		tio = alloc_tio(ci, ti, target_bio_nr);
+		tio = alloc_tio(ci, ti, 0, target_bio_nr);
 		tio->len_ptr = len;
 		clone_bio(tio, bio, sector, *len);
 		__map_bio(tio);
@@ -1925,7 +1931,7 @@ static void dm_request_fn(struct request_queue *q)
 	while (!blk_queue_stopped(q)) {
 		rq = blk_peek_request(q);
 		if (!rq)
-			goto delay_and_out;
+			goto out;
 
 		/* always use block 0 to find the target for flushes for now */
 		pos = 0;
@@ -1964,7 +1970,7 @@ requeued:
 	spin_lock(q->queue_lock);
 
 delay_and_out:
-	blk_delay_queue(q, 10);
+	blk_delay_queue(q, HZ / 10);
 out:
 	dm_put_live_table(md, srcu_idx);
 }
@@ -2583,7 +2589,6 @@ EXPORT_SYMBOL_GPL(dm_device_name);
 
 static void __dm_destroy(struct mapped_device *md, bool wait)
 {
-	struct request_queue *q = dm_get_md_queue(md);
 	struct dm_table *map;
 	int srcu_idx;
 
@@ -2593,10 +2598,6 @@ static void __dm_destroy(struct mapped_device *md, bool wait)
 	idr_replace(&_minor_idr, MINOR_ALLOCED, MINOR(disk_devt(dm_disk(md))));
 	set_bit(DMF_FREEING, &md->flags);
 	spin_unlock(&_minor_lock);
-
-	spin_lock_irq(q->queue_lock);
-	queue_flag_set(QUEUE_FLAG_DYING, q);
-	spin_unlock_irq(q->queue_lock);
 
 	/*
 	 * Take suspend_lock so that presuspend and postsuspend methods
@@ -3099,7 +3100,7 @@ struct dm_md_mempools *dm_alloc_md_mempools(unsigned type, unsigned integrity, u
 	if (!pools->io_pool)
 		goto out;
 
-	pools->bs = bioset_create_nobvec(pool_size, front_pad);
+	pools->bs = bioset_create(pool_size, front_pad);
 	if (!pools->bs)
 		goto out;
 

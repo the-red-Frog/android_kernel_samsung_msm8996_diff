@@ -181,13 +181,17 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 
 	/* check for timestamp cookie support */
 	memset(&tcp_opt, 0, sizeof(tcp_opt));
-	tcp_parse_options(skb, &tcp_opt, 0, NULL);
+	tcp_parse_options(skb, &tcp_opt, 
+#ifdef CONFIG_MPTCP					
+		&mopt, 
+#endif
+			0, NULL);
 
 	if (!cookie_check_timestamp(&tcp_opt, sock_net(sk), &ecn_ok))
 		goto out;
 
 	ret = NULL;
-	req = inet_reqsk_alloc(&tcp6_request_sock_ops, sk);
+	req = inet_reqsk_alloc(&tcp6_request_sock_ops);
 	if (!req)
 		goto out;
 
@@ -250,16 +254,23 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 		fl6.flowi6_uid = sk->sk_uid;
 		security_req_classify_flow(req, flowi6_to_flowi(&fl6));
 
-		dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl6, final_p);
+		dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
 		if (IS_ERR(dst))
 			goto out_free;
 	}
 
 	req->window_clamp = tp->window_clamp ? :dst_metric(dst, RTAX_WINDOW);
+#ifdef CONFIG_MPTCP
+	tp->ops->select_initial_window(tcp_full_space(sk), req->mss,
+				       &req->rcv_wnd, &req->window_clamp,
+				       ireq->wscale_ok, &rcv_wscale,
+				       dst_metric(dst, RTAX_INITRWND), sk);
+#else
 	tcp_select_initial_window(tcp_full_space(sk), req->mss,
 				  &req->rcv_wnd, &req->window_clamp,
 				  ireq->wscale_ok, &rcv_wscale,
 				  dst_metric(dst, RTAX_INITRWND));
+#endif
 
 	ireq->rcv_wscale = rcv_wscale;
 

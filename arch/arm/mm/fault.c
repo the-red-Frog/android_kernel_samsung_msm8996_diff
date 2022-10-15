@@ -28,6 +28,8 @@
 
 #include "fault.h"
 
+#include <trace/events/exception.h>
+
 #ifdef CONFIG_MMU
 
 #ifdef CONFIG_KPROBES
@@ -164,6 +166,8 @@ __do_user_fault(struct task_struct *tsk, unsigned long addr,
 {
 	struct siginfo si;
 
+	trace_user_fault(tsk, addr, fsr);
+
 #ifdef CONFIG_DEBUG_USER
 	if (((user_debug & UDBG_SEGV) && (sig == SIGSEGV)) ||
 	    ((user_debug & UDBG_BUS)  && (sig == SIGBUS))) {
@@ -212,7 +216,7 @@ static inline bool access_error(unsigned int fsr, struct vm_area_struct *vma)
 {
 	unsigned int mask = VM_READ | VM_WRITE | VM_EXEC;
 
-	if ((fsr & FSR_WRITE) && !(fsr & FSR_CM))
+	if (fsr & FSR_WRITE)
 		mask = VM_WRITE;
 	if (fsr & FSR_LNX_PF)
 		mask = VM_EXEC;
@@ -282,7 +286,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 
 	if (user_mode(regs))
 		flags |= FAULT_FLAG_USER;
-	if ((fsr & FSR_WRITE) && !(fsr & FSR_CM))
+	if (fsr & FSR_WRITE)
 		flags |= FAULT_FLAG_WRITE;
 
 	/*
@@ -554,6 +558,8 @@ do_DataAbort(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	if (!inf->fn(addr, fsr & ~FSR_LNX_PF, regs))
 		return;
 
+	trace_unhandled_abort(regs, addr, fsr);
+
 	printk(KERN_ALERT "Unhandled fault: %s (0x%03x) at 0x%08lx\n",
 		inf->name, fsr, addr);
 
@@ -585,6 +591,8 @@ do_PrefetchAbort(unsigned long addr, unsigned int ifsr, struct pt_regs *regs)
 
 	if (!inf->fn(addr, ifsr | FSR_LNX_PF, regs))
 		return;
+
+	trace_unhandled_abort(regs, addr, ifsr);
 
 	printk(KERN_ALERT "Unhandled prefetch abort: %s (0x%03x) at 0x%08lx\n",
 		inf->name, ifsr, addr);

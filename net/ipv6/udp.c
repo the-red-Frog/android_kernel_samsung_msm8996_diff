@@ -53,11 +53,11 @@
 #include <trace/events/skb.h>
 #include "udp_impl.h"
 
-static unsigned int udp6_ehashfn(struct net *net,
-				  const struct in6_addr *laddr,
-				  const u16 lport,
-				  const struct in6_addr *faddr,
-				  const __be16 fport)
+static u32 udp6_ehashfn(const struct net *net,
+			const struct in6_addr *laddr,
+			const u16 lport,
+			const struct in6_addr *faddr,
+			const __be16 fport)
 {
 	static u32 udp6_ehash_secret __read_mostly;
 	static u32 udp_ipv6_hash_secret __read_mostly;
@@ -104,9 +104,9 @@ int ipv6_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2)
 	return 0;
 }
 
-static unsigned int udp6_portaddr_hash(struct net *net,
-				       const struct in6_addr *addr6,
-				       unsigned int port)
+static u32 udp6_portaddr_hash(const struct net *net,
+			      const struct in6_addr *addr6,
+			      unsigned int port)
 {
 	unsigned int hash, mix = net_hash_mix(net);
 
@@ -429,7 +429,8 @@ try_again:
 		err = skb_copy_datagram_iovec(skb, sizeof(struct udphdr),
 					      msg->msg_iov, copied);
 	else {
-		err = skb_copy_and_csum_datagram_iovec(skb, sizeof(struct udphdr), msg->msg_iov);
+		err = skb_copy_and_csum_datagram_iovec(skb, sizeof(struct udphdr),
+						       msg->msg_iov, copied);
 		if (err == -EINVAL)
 			goto csum_copy_err;
 	}
@@ -570,7 +571,7 @@ out:
 	sock_put(sk);
 }
 
-int __udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+static int __udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	int rc;
 
@@ -656,7 +657,7 @@ int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	/*
 	 * UDP-Lite specific tests, ignored on UDP sockets (see net/ipv4/udp.c).
 	 */
-	if ((up->pcflag & UDPLITE_RECV_CC)  &&  UDP_SKB_CB(skb)->partial_cov) {
+	if ((is_udplite & UDPLITE_RECV_CC)  &&  UDP_SKB_CB(skb)->partial_cov) {
 
 		if (up->pcrlen == 0) {          /* full coverage was set  */
 			LIMIT_NETDEBUG(KERN_WARNING "UDPLITE6: partial coverage"
@@ -672,8 +673,10 @@ int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 		}
 	}
 
-	if (udp_lib_checksum_complete(skb))
-		goto csum_error;
+	if (rcu_access_pointer(sk->sk_filter)) {
+		if (udp_lib_checksum_complete(skb))
+			goto csum_error;
+	}
 
 	if (sk_rcvqueues_full(sk, sk->sk_rcvbuf)) {
 		UDP6_INC_STATS_BH(sock_net(sk),
@@ -784,10 +787,10 @@ static int __udp6_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
 
 	if (use_hash2) {
 		hash2_any = udp6_portaddr_hash(net, &in6addr_any, hnum) &
-			    udptable->mask;
-		hash2 = udp6_portaddr_hash(net, daddr, hnum) & udptable->mask;
+			    udp_table.mask;
+		hash2 = udp6_portaddr_hash(net, daddr, hnum) & udp_table.mask;
 start_lookup:
-		hslot = &udptable->hash2[hash2];
+		hslot = &udp_table.hash2[hash2];
 		offset = offsetof(typeof(*sk), __sk_common.skc_portaddr_node);
 	}
 
@@ -988,7 +991,6 @@ static void udp6_hwcsum_outgoing(struct sock *sk, struct sk_buff *skb,
 		 */
 		offset = skb_transport_offset(skb);
 		skb->csum = skb_checksum(skb, offset, skb->len - offset, 0);
-		csum = skb->csum;
 
 		skb->ip_summed = CHECKSUM_NONE;
 
@@ -1137,8 +1139,13 @@ int udpv6_sendmsg(struct kiocb *iocb, struct sock *sk,
 			msg->msg_name = &sin;
 			msg->msg_namelen = sizeof(sin);
 do_udp_sendmsg:
-			if (__ipv6_only_sock(sk))
+			if (__ipv6_only_sock(sk)) {
+				printk(KERN_DEBUG "udpv6_sendmsg() ipv6_addr_v4mapped & __ipv6_only_sock\n");
+				printk(KERN_DEBUG "udpv6_sendmsg() s6_addr32 %08X %08X %08X %08X\n",
+				daddr->s6_addr32[0], daddr->s6_addr32[1],
+				daddr->s6_addr32[2], daddr->s6_addr32[3]);
 				return -ENETUNREACH;
+			}
 			return udp_sendmsg(iocb, sk, msg, len);
 		}
 	}

@@ -37,6 +37,10 @@
 #include <asm/page.h>
 #include <asm/virt.h>
 
+#ifdef CONFIG_RKP_CFP_ROPP
+#include <asm/rkp_cfp.h>
+#endif
+
 #define __PHYS_OFFSET	(KERNEL_START - TEXT_OFFSET)
 
 #if (TEXT_OFFSET & 0xfff) != 0
@@ -207,9 +211,21 @@ section_table:
 #endif
 
 ENTRY(stext)
+#ifdef CONFIG_RKP_CFP_ROPP
+	/* Must intialize RRK to zero */
+	mov	RRK, #0
+#endif
+#ifdef CONFIG_RELOCATABLE_KERNEL
+	mov	x24, x1				// x1=PHYS_OFFSET
+	mov	x19, x2				// x2=real TEXT_OFFSET
+	adr	x21, __boot_kernel_offset
+	stp	x1, x2, [x21]
+#endif 
 	bl	preserve_boot_args
 	bl	el2_setup			// Drop to EL1, w20=cpu_boot_mode
+#ifndef CONFIG_RELOCATABLE_KERNEL
 	adrp	x24, __PHYS_OFFSET
+#endif 
 	bl	set_cpu_boot_mode_flag
 
 	bl	__vet_fdt
@@ -220,12 +236,50 @@ ENTRY(stext)
 	 * On return, the CPU will be ready for the MMU to be turned on and
 	 * the TCR will have been set.
 	 */
+#ifndef	CONFIG_RELOCATABLE_KERNEL
 	ldr	x27, =__mmap_switched		// address to jump to after
-						// MMU has been enabled
+#else
+	adr 	x27, __relocate_kernel
+#endif
 	adr_l	lr, __enable_mmu		// return (PIC) address
 	b	__cpu_setup			// initialise processor
 ENDPROC(stext)
 
+#ifdef CONFIG_RELOCATABLE_KERNEL
+
+#define R_AARCH64_RELATIVE	0x403
+#define R_AARCH64_ABS64		0x101
+
+__relocate_kernel:
+
+	sub	x23, x19, #TEXT_OFFSET
+	adrp 	x8, __dynsym_start		
+	add	x8, x8, :lo12:__dynsym_start	//x8: start of symbol table
+	adrp 	x9, __reloc_start		
+	add 	x9, x9, :lo12:__reloc_start	//x9: start of relocation table
+	adrp	x10, __reloc_end
+	add	x10, x10, :lo12:__reloc_end 	//x10: end of relocation table
+
+0:	cmp	x9, x10
+	b.hs	1f
+	ldp	x11, x12, [x9], #24
+	cmp	x12, #R_AARCH64_RELATIVE
+	b.ne	0b
+	ldr	x12, [x9, #-8]
+	add	x12, x12, x23			// relocate origin x23 
+	add	x11, x11, x23
+	str	x12, [x11, x28]
+	b	0b
+
+1:	ldr	x8, =vectors			// reload VBAR_EL1 with
+	msr	vbar_el1, x8			// relocated address
+	isb
+
+	ldr	x9, =__mmap_switched
+	br	x9
+ENDPROC(__relocate_kernel)
+#endif /*CONFIG_RELOCATABLE_KERNEL*/
+	
 /*
  * Preserve the arguments passed by the bootloader in x0 .. x3
  */
@@ -408,7 +462,13 @@ __create_page_tables:
 	mov	x0, x26				// swapper_pg_dir
 	mov	x5, #PAGE_OFFSET
 	create_pgd_entry x0, x5, x3, x6
+#ifdef CONFIG_RELOCATABLE_KERNEL
+	adr_l	x6, KERNEL_END			// __pa(KERNEL_END)
+	sub	x6, x6, x24				// x24 = PHYS_OFFSET
+	add	x6, x6, x5				// x5 = PAGE_OFFSET, x6 =  __pa(KERNEL_END) - PHYS_OFFSET + PAGE_OFFSET
+#else
 	ldr	x6, =KERNEL_END			// __va(KERNEL_END)
+#endif	
 	mov	x3, x24				// phys offset
 	create_block_map x0, x7, x3, x5, x6
 
@@ -448,6 +508,15 @@ ENDPROC(__create_page_tables)
  */
 	.set	initial_sp, init_thread_union + THREAD_START_SP
 __mmap_switched:
+#ifdef CONFIG_TIMA_RKP
+	ldr	x6, =rkp_map_bitmap
+	add	x7, x6, 0x30000
+3:	cmp	x6, x7
+	b.hs	4f
+	str	xzr, [x6], #8			// Clear BSS
+	b	3b
+4:
+#endif
 	// Clear BSS
 	adr_l	x0, __bss_start
 	mov	x1, xzr
@@ -456,14 +525,24 @@ __mmap_switched:
 	bl	__pi_memset
 	dsb	ishst				// Make zero page visible to PTW
 
-	adrp	x4, initial_sp
-	add	sp, x4, :lo12:initial_sp
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+        adrp    x4, init_thread_union
+        add     sp, x4, #THREAD_SIZE
+        adr_l   x5, init_task
+        msr     sp_el0, x5                      // Save thread_info
+#else
+	adr_l	sp, initial_sp, x4
 	mov	x4, sp
 	and	x4, x4, #~(THREAD_SIZE - 1)
 	msr	sp_el0, x4			// Save thread_info
+#endif
+
 	str_l	x21, __fdt_pointer, x5		// Save FDT pointer
 	str_l	x24, memstart_addr, x6		// Save PHYS_OFFSET
 	mov	x29, #0
+#ifdef CONFIG_KASAN
+	bl	kasan_early_init
+#endif
 	b	start_kernel
 ENDPROC(__mmap_switched)
 
@@ -544,15 +623,9 @@ CPU_LE(	movk	x0, #0x30d0, lsl #16	)	// Clear EE and E0E on LE systems
 #endif
 
 	/* EL2 debug */
-	mrs	x0, id_aa64dfr0_el1		// Check ID_AA64DFR0_EL1 PMUVer
-	sbfx	x0, x0, #8, #4
-	cmp	x0, #1
-	b.lt	4f				// Skip if no PMU present
 	mrs	x0, pmcr_el0			// Disable debug access traps
 	ubfx	x0, x0, #11, #5			// to EL2 and allow access to
-4:
-	csel	x0, xzr, x0, lt			// all PMU counters from EL1
-	msr	mdcr_el2, x0			// (if they exist)
+	msr	mdcr_el2, x0			// all PMU counters from EL1
 
 	/* Stage-2 translation */
 	msr	vttbr_el2, xzr
@@ -586,6 +659,14 @@ ENTRY(set_cpu_boot_mode_flag)
 	ret
 ENDPROC(set_cpu_boot_mode_flag)
 
+#ifdef CONFIG_RELOCATABLE_KERNEL
+ENTRY(__boot_kernel_offset)
+	.quad	0     	//Kernel Physical Address
+	.quad	0	//Kernel Virtual Offset -- from the static compiling address
+	.quad 	TEXT_OFFSET 
+#endif	
+	
+	
 /*
  * We need to find out the CPU boot mode long after boot, so we need to
  * store it in a writable variable.
@@ -618,7 +699,6 @@ ENTRY(secondary_holding_pen)
 pen:	ldr	x4, [x3]
 	cmp	x4, x0
 	b.eq	secondary_startup
-	wfe
 	b	pen
 ENDPROC(secondary_holding_pen)
 
@@ -636,20 +716,35 @@ ENTRY(secondary_startup)
 	/*
 	 * Common entry point for secondary CPUs.
 	 */
-	adrp	x25, idmap_pg_dir
-	adrp	x26, swapper_pg_dir
-	bl	__cpu_setup			// initialise processor
-
+	adrp    x25, idmap_pg_dir
+	adrp    x26, swapper_pg_dir
+	bl  __cpu_setup         // initialise processor
 	ldr	x21, =secondary_data
 	ldr	x27, =__secondary_switched	// address to jump to after enabling the MMU
 	b	__enable_mmu
 ENDPROC(secondary_startup)
 
 ENTRY(__secondary_switched)
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	adr_l	x0, secondary_data
+	ldr	x1, [x0, #CPU_BOOT_STACK]	// get secondary_data.stack
+	mov	sp, x1
+	ldr	x2, [x0, #CPU_BOOT_TASK]
+	msr	sp_el0, x2
+#else
 	ldr	x0, [x21]			// get secondary_data.stack
 	mov	sp, x0
+#ifdef CONFIG_RKP_CFP_ROPP
+	/* We are running off of the stack of the idle thread for this CPU.
+	 * The idle thread was forked from the CPU0 thread after it initialized its key.
+	 * We need to load our key from thread_info into x17 now.
+	 */
+	get_thread_info tsk
+	load_key tsk
+#endif
 	and	x0, x0, #~(THREAD_SIZE - 1)
 	msr	sp_el0, x0			// save thread_info
+#endif
 	mov	x29, #0
 	b	secondary_start_kernel
 ENDPROC(__secondary_switched)

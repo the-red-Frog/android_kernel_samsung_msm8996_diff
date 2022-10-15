@@ -277,6 +277,8 @@ struct module {
 	bool sig_ok;
 #endif
 
+	bool async_probe_requested;
+
 	/* symbols that will be GPL-only in the near future. */
 	const struct kernel_symbol *gpl_future_syms;
 	const unsigned long *gpl_future_crcs;
@@ -517,6 +519,11 @@ int unregister_module_notifier(struct notifier_block *nb);
 
 extern void print_modules(void);
 
+static inline bool module_requested_async_probing(struct module *module)
+{
+	return module && module->async_probe_requested;
+}
+
 #else /* !CONFIG_MODULES... */
 
 /* Given an address, look for it in the exception tables. */
@@ -627,6 +634,12 @@ static inline int unregister_module_notifier(struct notifier_block *nb)
 static inline void print_modules(void)
 {
 }
+
+static inline bool module_requested_async_probing(struct module *module)
+{
+	return false;
+}
+
 #endif /* CONFIG_MODULES */
 
 #ifdef CONFIG_SYSFS
@@ -664,12 +677,4 @@ static inline void module_bug_finalize(const Elf_Ehdr *hdr,
 static inline void module_bug_cleanup(struct module *mod) {}
 #endif	/* CONFIG_GENERIC_BUG */
 
-#ifdef RETPOLINE
-extern bool retpoline_module_ok(bool has_retpoline);
-#else
-static inline bool retpoline_module_ok(bool has_retpoline)
-{
-	return true;
-}
-#endif
 #endif /* _LINUX_MODULE_H */

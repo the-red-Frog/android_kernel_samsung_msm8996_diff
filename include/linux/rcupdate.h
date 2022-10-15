@@ -99,7 +99,6 @@ void do_trace_rcu_torture_read(const char *rcutorturename,
 #define UINT_CMP_LT(a, b)	(UINT_MAX / 2 < (a) - (b))
 #define ULONG_CMP_GE(a, b)	(ULONG_MAX / 2 >= (a) - (b))
 #define ULONG_CMP_LT(a, b)	(ULONG_MAX / 2 < (a) - (b))
-#define ulong2long(a)		(*(long *)(&(a)))
 
 /* Exported common interfaces */
 
@@ -859,7 +858,7 @@ static inline void rcu_preempt_sleep_check(void)
  * read-side critical sections may be preempted and they may also block, but
  * only when acquiring spinlocks that are subject to priority inheritance.
  */
-static __always_inline void rcu_read_lock(void)
+static inline void rcu_read_lock(void)
 {
 	__rcu_read_lock();
 	__acquire(RCU);

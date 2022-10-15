@@ -813,8 +813,6 @@ mwifiex_cmd_802_11_ad_hoc_start(struct mwifiex_private *priv,
 
 	memset(adhoc_start->ssid, 0, IEEE80211_MAX_SSID_LEN);
 
-	if (req_ssid->ssid_len > IEEE80211_MAX_SSID_LEN)
-		req_ssid->ssid_len = IEEE80211_MAX_SSID_LEN;
 	memcpy(adhoc_start->ssid, req_ssid->ssid, req_ssid->ssid_len);
 
 	dev_dbg(adapter->dev, "info: ADHOC_S_CMD: SSID = %s\n",
@@ -1425,7 +1423,7 @@ int mwifiex_deauthenticate(struct mwifiex_private *priv, u8 *mac)
 		ret = mwifiex_deauthenticate_infra(priv, mac);
 		if (ret)
 			cfg80211_disconnected(priv->netdev, 0, NULL, 0,
-					      GFP_KERNEL);
+					      true, GFP_KERNEL);
 		break;
 	case NL80211_IFTYPE_ADHOC:
 		return mwifiex_send_cmd(priv, HostCmd_CMD_802_11_AD_HOC_STOP,

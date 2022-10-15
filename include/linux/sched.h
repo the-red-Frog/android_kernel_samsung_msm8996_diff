@@ -25,7 +25,7 @@ struct sched_param {
 #include <linux/errno.h>
 #include <linux/nodemask.h>
 #include <linux/mm_types.h>
-#include <linux/preempt_mask.h>
+#include <linux/preempt.h>
 
 #include <asm/page.h>
 #include <asm/ptrace.h>
@@ -168,6 +168,7 @@ extern int nr_threads;
 DECLARE_PER_CPU(unsigned long, process_counts);
 extern int nr_processes(void);
 extern unsigned long nr_running(void);
+extern bool cpu_has_rt_task(int cpu);
 extern bool single_task_running(void);
 extern unsigned long nr_iowait(void);
 extern unsigned long nr_iowait_cpu(int cpu);
@@ -175,6 +176,10 @@ extern void get_iowait_load(unsigned long *nr_waiters, unsigned long *load);
 #ifdef CONFIG_CPU_QUIET
 extern u64 nr_running_integral(unsigned int cpu);
 #endif
+
+extern void sched_update_nr_prod(int cpu, long delta, bool inc);
+extern void sched_get_nr_running_avg(int *avg, int *iowait_avg, int *big_avg);
+extern u64 sched_get_cpu_last_busy_time(int cpu);
 
 extern void calc_global_load(unsigned long ticks);
 
@@ -222,9 +227,11 @@ print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq);
 #define TASK_WAKEKILL		128
 #define TASK_WAKING		256
 #define TASK_PARKED		512
-#define TASK_STATE_MAX		1024
+#define TASK_NOLOAD		1024
+#define TASK_NEW		2048
+#define TASK_STATE_MAX		4096
 
-#define TASK_STATE_TO_CHAR_STR "RSDTtXZxKWP"
+#define TASK_STATE_TO_CHAR_STR "RSDTtXZxKWPNn"
 
 extern char ___assert_task_state[1 - 2*!!(
 		sizeof(TASK_STATE_TO_CHAR_STR)-1 != ilog2(TASK_STATE_MAX)+1)];
@@ -233,6 +240,8 @@ extern char ___assert_task_state[1 - 2*!!(
 #define TASK_KILLABLE		(TASK_WAKEKILL | TASK_UNINTERRUPTIBLE)
 #define TASK_STOPPED		(TASK_WAKEKILL | __TASK_STOPPED)
 #define TASK_TRACED		(TASK_WAKEKILL | __TASK_TRACED)
+
+#define TASK_IDLE		(TASK_UNINTERRUPTIBLE | TASK_NOLOAD)
 
 /* Convenience macros for the sake of wake_up */
 #define TASK_NORMAL		(TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE)
@@ -249,7 +258,8 @@ extern char ___assert_task_state[1 - 2*!!(
 			((task->state & (__TASK_STOPPED | __TASK_TRACED)) != 0)
 #define task_contributes_to_load(task)	\
 				((task->state & TASK_UNINTERRUPTIBLE) != 0 && \
-				 (task->flags & PF_FROZEN) == 0)
+				 (task->flags & PF_FROZEN) == 0 && \
+				 (task->state & TASK_NOLOAD) == 0)
 
 #define __set_task_state(tsk, state_value)		\
 	do { (tsk)->state = (state_value); } while (0)
@@ -307,6 +317,8 @@ extern asmlinkage void schedule_tail(struct task_struct *prev);
 extern void init_idle(struct task_struct *idle, int cpu);
 extern void init_idle_bootup_task(struct task_struct *idle);
 
+extern cpumask_var_t cpu_isolated_map;
+
 extern int runqueue_is_locked(int cpu);
 
 #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
@@ -340,6 +352,9 @@ extern void show_regs(struct pt_regs *);
  * trace (or NULL if the entire call-chain of the task should be shown).
  */
 extern void show_stack(struct task_struct *task, unsigned long *sp);
+
+void io_schedule(void);
+long io_schedule_timeout(long timeout);
 
 extern void cpu_init (void);
 extern void trap_init(void);
@@ -396,13 +411,6 @@ extern signed long schedule_timeout_killable(signed long timeout);
 extern signed long schedule_timeout_uninterruptible(signed long timeout);
 asmlinkage void schedule(void);
 extern void schedule_preempt_disabled(void);
-
-extern long io_schedule_timeout(long timeout);
-
-static inline void io_schedule(void)
-{
-	io_schedule_timeout(MAX_SCHEDULE_TIMEOUT);
-}
 
 struct nsproxy;
 struct user_namespace;
@@ -789,8 +797,9 @@ struct user_struct {
 	unsigned long mq_bytes;	/* How many bytes can be allocated to mqueue? */
 #endif
 	unsigned long locked_shm; /* How many pages of mlocked shm ? */
-	unsigned long unix_inflight;	/* How many files in flight in unix sockets */
 	atomic_long_t pipe_bufs;  /* how many pages are allocated in pipe buffers */
+	unsigned long unix_inflight;	/* How many files in flight in unix sockets */
+// fix build error	atomic_long_t pipe_bufs;  /* how many pages are allocated in pipe buffers */
 
 #ifdef CONFIG_KEYS
 	struct key *uid_keyring;	/* UID specific keyring */
@@ -897,6 +906,51 @@ struct sched_capacity_reqs {
 };
 
 /*
+ * Wake-queues are lists of tasks with a pending wakeup, whose
+ * callers have already marked the task as woken internally,
+ * and can thus carry on. A common use case is being able to
+ * do the wakeups once the corresponding user lock as been
+ * released.
+ *
+ * We hold reference to each task in the list across the wakeup,
+ * thus guaranteeing that the memory is still valid by the time
+ * the actual wakeups are performed in wake_up_q().
+ *
+ * One per task suffices, because there's never a need for a task to be
+ * in two wake queues simultaneously; it is forbidden to abandon a task
+ * in a wake queue (a call to wake_up_q() _must_ follow), so if a task is
+ * already in a wake queue, the wakeup will happen soon and the second
+ * waker can just skip it.
+ *
+ * The WAKE_Q macro declares and initializes the list head.
+ * wake_up_q() does NOT reinitialize the list; it's expected to be
+ * called near the end of a function, where the fact that the queue is
+ * not used again will be easy to see by inspection.
+ *
+ * Note that this can cause spurious wakeups. schedule() callers
+ * must ensure the call is done inside a loop, confirming that the
+ * wakeup condition has in fact occurred.
+ */
+struct wake_q_node {
+	struct wake_q_node *next;
+};
+
+struct wake_q_head {
+	struct wake_q_node *first;
+	struct wake_q_node **lastp;
+	int count;
+};
+
+#define WAKE_Q_TAIL ((struct wake_q_node *) 0x01)
+
+#define WAKE_Q(name)					\
+	struct wake_q_head name = { WAKE_Q_TAIL, &name.first, 0 }
+
+extern void wake_q_add(struct wake_q_head *head,
+		       struct task_struct *task);
+extern void wake_up_q(struct wake_q_head *head);
+
+/*
  * sched-domains (multiprocessor balancing) declarations:
  */
 #ifdef CONFIG_SMP
@@ -906,7 +960,8 @@ struct sched_capacity_reqs {
 #define SD_BALANCE_FORK		0x0008	/* Balance on fork, clone */
 #define SD_BALANCE_WAKE		0x0010  /* Balance on wakeup */
 #define SD_WAKE_AFFINE		0x0020	/* Wake task to waking CPU */
-#define SD_SHARE_CPUCAPACITY	0x0080	/* Domain members share cpu power */
+#define SD_ASYM_CPUCAPACITY	0x0040  /* Groups have different max cpu capacities */
+#define SD_SHARE_CPUCAPACITY	0x0080	/* Domain members share cpu capacity */
 #define SD_SHARE_POWERDOMAIN	0x0100	/* Domain members share power domain */
 #define SD_SHARE_PKG_RESOURCES	0x0200	/* Domain members share cpu pkg resources */
 #define SD_SERIALIZE		0x0400	/* Only a single load balancing instance */
@@ -966,6 +1021,37 @@ struct sched_group_energy {
 unsigned long capacity_curr_of(int cpu);
 
 struct sched_group;
+
+struct eas_stats {
+	/* select_idle_sibling() stats */
+	u64 sis_attempts;
+	u64 sis_idle;
+	u64 sis_cache_affine;
+	u64 sis_suff_cap;
+	u64 sis_idle_cpu;
+	u64 sis_count;
+
+	/* select_energy_cpu_brute() stats */
+	u64 secb_attempts;
+	u64 secb_sync;
+	u64 secb_idle_bt;
+	u64 secb_insuff_cap;
+	u64 secb_no_nrg_sav;
+	u64 secb_nrg_sav;
+	u64 secb_count;
+
+	/* find_best_target() stats */
+	u64 fbt_attempts;
+	u64 fbt_no_cpu;
+	u64 fbt_no_sd;
+	u64 fbt_pref_idle;
+	u64 fbt_count;
+
+	/* cas */
+	/* select_task_rq_fair() stats */
+	u64 cas_attempts;
+	u64 cas_count;
+};
 
 struct sched_domain {
 	/* These fields must be setup */
@@ -1027,6 +1113,8 @@ struct sched_domain {
 	unsigned int ttwu_wake_remote;
 	unsigned int ttwu_move_affine;
 	unsigned int ttwu_move_balance;
+
+	struct eas_stats eas_stats;
 #endif
 #ifdef CONFIG_SCHED_DEBUG
 	char *name;
@@ -1152,6 +1240,7 @@ struct sched_avg {
 	u64 last_update_time, load_sum;
 	u32 util_sum, period_contrib;
 	unsigned long load_avg, util_avg;
+	unsigned long load_avg_contirib;
 };
 
 #ifdef CONFIG_SCHEDSTATS
@@ -1187,6 +1276,35 @@ struct sched_statistics {
 	u64			nr_wakeups_affine_attempts;
 	u64			nr_wakeups_passive;
 	u64			nr_wakeups_idle;
+
+	/* select_idle_sibling() */
+	u64			nr_wakeups_sis_attempts;
+	u64			nr_wakeups_sis_idle;
+	u64			nr_wakeups_sis_cache_affine;
+	u64			nr_wakeups_sis_suff_cap;
+	u64			nr_wakeups_sis_idle_cpu;
+	u64			nr_wakeups_sis_count;
+
+	/* energy_aware_wake_cpu() */
+	u64			nr_wakeups_secb_attempts;
+	u64			nr_wakeups_secb_sync;
+	u64			nr_wakeups_secb_idle_bt;
+	u64			nr_wakeups_secb_insuff_cap;
+	u64			nr_wakeups_secb_no_nrg_sav;
+	u64			nr_wakeups_secb_nrg_sav;
+	u64			nr_wakeups_secb_count;
+
+	/* find_best_target() */
+	u64			nr_wakeups_fbt_attempts;
+	u64			nr_wakeups_fbt_no_cpu;
+	u64			nr_wakeups_fbt_no_sd;
+	u64			nr_wakeups_fbt_pref_idle;
+	u64			nr_wakeups_fbt_count;
+
+	/* cas */
+	/* select_task_rq_fair() */
+	u64			nr_wakeups_cas_attempts;
+	u64			nr_wakeups_cas_count;
 };
 #endif
 
@@ -1262,6 +1380,8 @@ struct sched_rt_entity {
 	unsigned long timeout;
 	unsigned long watchdog_stamp;
 	unsigned int time_slice;
+	unsigned short on_rq;
+	unsigned short on_list;
 
 	struct sched_rt_entity *back;
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -1285,7 +1405,6 @@ struct sched_dl_entity {
 	u64 dl_deadline;	/* relative deadline of each instance	*/
 	u64 dl_period;		/* separation of two instances (period) */
 	u64 dl_bw;		/* dl_runtime / dl_deadline		*/
-	u64 dl_density;		/* dl_runtime / dl_deadline		*/
 
 	/*
 	 * Actual scheduling parameters. Initialized with the values above,
@@ -1340,13 +1459,6 @@ enum perf_event_task_context {
 };
 
 struct task_struct {
-#ifdef CONFIG_THREAD_INFO_IN_TASK
-	/*
-	 * For reasons of header soup (see current_thread_info()), this
-	 * must be the first element of task_struct.
-	 */
-	struct thread_info thread_info;
-#endif
 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
 	void *stack;
 	atomic_t usage;
@@ -1356,9 +1468,6 @@ struct task_struct {
 #ifdef CONFIG_SMP
 	struct llist_node wake_entry;
 	int on_cpu;
-#ifdef CONFIG_THREAD_INFO_IN_TASK
-	unsigned int cpu;	/* current CPU */
-#endif
 	unsigned int wakee_flips;
 	unsigned long wakee_flip_decay_ts;
 	struct task_struct *last_wakee;
@@ -1379,6 +1488,7 @@ struct task_struct {
 	 * of this task
 	 */
 	u32 init_load_pct;
+	u64 last_sleep_ts;
 #endif
 
 #ifdef CONFIG_CGROUP_SCHED
@@ -1425,9 +1535,6 @@ struct task_struct {
 #endif
 
 	struct mm_struct *mm, *active_mm;
-#ifdef CONFIG_COMPAT_BRK
-	unsigned brk_randomized:1;
-#endif
 	/* per-thread vma caching */
 	u64 vmacache_seqnum;
 	struct vm_area_struct *vmacache[VMACACHE_SIZE];
@@ -1450,11 +1557,15 @@ struct task_struct {
 	/* Revert to default priority/policy when forking */
 	unsigned sched_reset_on_fork:1;
 	unsigned sched_contributes_to_load:1;
+	unsigned sched_migrated:1;
+
+#ifdef CONFIG_COMPAT_BRK
+	unsigned brk_randomized:1;
+#endif
 
 	unsigned long atomic_flags; /* Flags needing atomic access. */
 
 	struct restart_block restart_block;
-
 	pid_t pid;
 	pid_t tgid;
 
@@ -1518,7 +1629,6 @@ struct task_struct {
 	struct list_head cpu_timers[3];
 
 /* process credentials */
-	const struct cred __rcu *ptracer_cred; /* Tracer's credentials at attach */
 	const struct cred __rcu *real_cred; /* objective and real subjective task
 					 * credentials (COW) */
 	const struct cred __rcu *cred;	/* effective (overridable) subjective task
@@ -1569,14 +1679,16 @@ struct task_struct {
 	struct seccomp seccomp;
 
 /* Thread group tracking */
-	u64 parent_exec_id;
-	u64 self_exec_id;
+   	u32 parent_exec_id;
+   	u32 self_exec_id;
 /* Protection of (de-)allocation: mm, files, fs, tty, keyrings, mems_allowed,
  * mempolicy */
 	spinlock_t alloc_lock;
 
 	/* Protection of the PI data structures: */
 	raw_spinlock_t pi_lock;
+
+	struct wake_q_node wake_q;
 
 #ifdef CONFIG_RT_MUTEXES
 	/* PI waiters blocked on a rt_mutex held by this task */
@@ -1612,6 +1724,9 @@ struct task_struct {
 	unsigned int lockdep_recursion;
 	struct held_lock held_locks[MAX_LOCK_DEPTH];
 	gfp_t lockdep_reclaim_gfp;
+#endif
+#ifdef CONFIG_UBSAN
+	unsigned int in_ubsan;
 #endif
 
 /* journalling filesystem info */
@@ -1659,8 +1774,6 @@ struct task_struct {
 #endif
 	struct list_head pi_state_list;
 	struct futex_pi_state *pi_state_cache;
-	struct mutex futex_exit_mutex;
-	unsigned int futex_state;
 #endif
 #ifdef CONFIG_PERF_EVENTS
 	struct perf_event_context *perf_event_ctxp[perf_nr_task_contexts];
@@ -1690,26 +1803,21 @@ struct task_struct {
 	struct numa_group *numa_group;
 
 	/*
-	 * Exponential decaying average of faults on a per-node basis.
-	 * Scheduling placement decisions are made based on the these counts.
-	 * The values remain static for the duration of a PTE scan
+	 * numa_faults is an array split into four regions:
+	 * faults_memory, faults_cpu, faults_memory_buffer, faults_cpu_buffer
+	 * in this precise order.
+	 *
+	 * faults_memory: Exponential decaying average of faults on a per-node
+	 * basis. Scheduling placement decisions are made based on these
+	 * counts. The values remain static for the duration of a PTE scan.
+	 * faults_cpu: Track the nodes the process was running on when a NUMA
+	 * hinting fault was incurred.
+	 * faults_memory_buffer and faults_cpu_buffer: Record faults per node
+	 * during the current scan window. When the scan completes, the counts
+	 * in faults_memory and faults_cpu decay and these values are copied.
 	 */
-	unsigned long *numa_faults_memory;
+	unsigned long *numa_faults;
 	unsigned long total_numa_faults;
-
-	/*
-	 * numa_faults_buffer records faults per node during the current
-	 * scan window. When the scan completes, the counts in
-	 * numa_faults_memory decay and these values are copied.
-	 */
-	unsigned long *numa_faults_buffer_memory;
-
-	/*
-	 * Track the nodes the process was running on when a NUMA hinting
-	 * fault was incurred.
-	 */
-	unsigned long *numa_faults_cpu;
-	unsigned long *numa_faults_buffer_cpu;
 
 	/*
 	 * numa_faults_locality tracks if faults recorded during the last
@@ -1756,6 +1864,9 @@ struct task_struct {
 	unsigned long timer_slack_ns;
 	unsigned long default_timer_slack_ns;
 
+#ifdef CONFIG_KASAN
+	unsigned int kasan_depth;
+#endif
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 	/* Index of current stored address in ret_stack */
 	int curr_ret_stack;
@@ -1777,6 +1888,17 @@ struct task_struct {
 	/* bitmask and counter of trace recursion */
 	unsigned long trace_recursion;
 #endif /* CONFIG_TRACING */
+#ifdef CONFIG_KCOV
+	/* Coverage collection mode enabled for this task (0 if disabled). */
+	enum kcov_mode kcov_mode;
+	/* Size of the kcov_area. */
+	unsigned	kcov_size;
+	/* Buffer for coverage collection. */
+	void		*kcov_area;
+	/* kcov desciptor wired with this task or NULL. */
+	struct kcov	*kcov;
+#endif
+
 #ifdef CONFIG_MEMCG /* memcg uses this to do batch job */
 	unsigned int memcg_kmem_skip_account;
 	struct memcg_oom_info {
@@ -1792,6 +1914,9 @@ struct task_struct {
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	unsigned int	sequential_io;
 	unsigned int	sequential_io_avg;
+#endif
+#ifdef CONFIG_SDP
+	unsigned int sensitive;
 #endif
 };
 
@@ -2038,6 +2163,7 @@ extern int task_free_unregister(struct notifier_block *n);
  * Per process flags
  */
 #define PF_EXITING	0x00000004	/* getting shut down */
+#define PF_EXITPIDONE	0x00000008	/* pi exit done on shut down */
 #define PF_VCPU		0x00000010	/* I'm a virtual CPU */
 #define PF_WQ_WORKER	0x00000020	/* I'm a workqueue worker */
 #define PF_FORKNOEXEC	0x00000040	/* forked but didn't exec */
@@ -2190,12 +2316,15 @@ static inline void tsk_restore_flags(struct task_struct *task,
 	task->flags |= orig_flags & flags;
 }
 
+extern int task_can_attach(struct task_struct *p,
+			   const struct cpumask *cs_cpus_allowed);
 #ifdef CONFIG_SMP
 extern void do_set_cpus_allowed(struct task_struct *p,
 			       const struct cpumask *new_mask);
 
 extern int set_cpus_allowed_ptr(struct task_struct *p,
 				const struct cpumask *new_mask);
+extern bool cpupri_check_rt(void);
 #else
 static inline void do_set_cpus_allowed(struct task_struct *p,
 				      const struct cpumask *new_mask)
@@ -2208,7 +2337,16 @@ static inline int set_cpus_allowed_ptr(struct task_struct *p,
 		return -EINVAL;
 	return 0;
 }
+static inline bool cpupri_check_rt(void)
+{
+	return false;
+}
 #endif
+
+static inline void set_wake_up_idle(bool enabled)
+{
+	/* do nothing yet for EAS */
+}
 
 #ifdef CONFIG_NO_HZ_COMMON
 void calc_load_enter_idle(void);
@@ -2217,6 +2355,13 @@ void calc_load_exit_idle(void);
 static inline void calc_load_enter_idle(void) { }
 static inline void calc_load_exit_idle(void) { }
 #endif /* CONFIG_NO_HZ_COMMON */
+
+#ifndef CONFIG_CPUMASK_OFFSTACK
+static inline int set_cpus_allowed(struct task_struct *p, cpumask_t new_mask)
+{
+	return set_cpus_allowed_ptr(p, &new_mask);
+}
+#endif
 
 /*
  * Do not use outside of architecture code which knows its limitations.
@@ -2370,9 +2515,7 @@ void yield(void);
 extern struct exec_domain	default_exec_domain;
 
 union thread_union {
-#ifndef CONFIG_THREAD_INFO_IN_TASK
 	struct thread_info thread_info;
-#endif
 	unsigned long stack[THREAD_SIZE/sizeof(long)];
 };
 
@@ -2546,7 +2689,7 @@ static inline void mmdrop(struct mm_struct * mm)
 }
 
 /* mmput gets rid of the mappings and all user-space */
-extern void mmput(struct mm_struct *);
+extern int mmput(struct mm_struct *);
 /* same as above but performs the slow path from the async kontext. Can
  * be called from the atomic context as well
  */
@@ -2560,10 +2703,8 @@ extern struct mm_struct *get_task_mm(struct task_struct *task);
  * succeeds.
  */
 extern struct mm_struct *mm_access(struct task_struct *task, unsigned int mode);
-/* Remove the current tasks stale references to the old mm_struct on exit() */
-extern void exit_mm_release(struct task_struct *, struct mm_struct *);
-/* Remove the current tasks stale references to the old mm_struct on exec() */
-extern void exec_mm_release(struct task_struct *, struct mm_struct *);
+/* Remove the current tasks stale references to the old mm_struct */
+extern void mm_release(struct task_struct *, struct mm_struct *);
 
 extern int copy_thread(unsigned long, unsigned long, unsigned long,
 			struct task_struct *);
@@ -2765,34 +2906,10 @@ static inline void threadgroup_lock(struct task_struct *tsk) {}
 static inline void threadgroup_unlock(struct task_struct *tsk) {}
 #endif
 
-#ifdef CONFIG_THREAD_INFO_IN_TASK
-
-static inline struct thread_info *task_thread_info(struct task_struct *task)
-{
-	return &task->thread_info;
-}
-
-/*
- * When accessing the stack of a non-current task that might exit, use
- * try_get_task_stack() instead.  task_stack_page will return a pointer
- * that could get freed out from under you.
- */
-static inline void *task_stack_page(const struct task_struct *task)
-{
-	return task->stack;
-}
-
-#define setup_thread_stack(new,old)	do { } while(0)
-
-static inline unsigned long *end_of_stack(const struct task_struct *task)
-{
-	return task->stack;
-}
-
-#elif !defined(__HAVE_THREAD_FUNCTIONS)
+#ifndef __HAVE_THREAD_FUNCTIONS
 
 #define task_thread_info(task)	((struct thread_info *)(task)->stack)
-#define task_stack_page(task)	((void *)(task)->stack)
+#define task_stack_page(task)	((task)->stack)
 
 static inline void setup_thread_stack(struct task_struct *p, struct task_struct *org)
 {
@@ -2819,14 +2936,6 @@ static inline unsigned long *end_of_stack(struct task_struct *p)
 }
 
 #endif
-
-static inline void *try_get_task_stack(struct task_struct *tsk)
-{
-	return task_stack_page(tsk);
-}
-
-static inline void put_task_stack(struct task_struct *tsk) {}
-
 #define task_stack_end_corrupted(task) \
 		(*(end_of_stack(task)) != STACK_END_MAGIC)
 
@@ -3103,11 +3212,7 @@ static inline void ptrace_signal_wake_up(struct task_struct *t, bool resume)
 
 static inline unsigned int task_cpu(const struct task_struct *p)
 {
-#ifdef CONFIG_THREAD_INFO_IN_TASK
-	return p->cpu;
-#else
 	return task_thread_info(p)->cpu;
-#endif
 }
 
 static inline int task_node(const struct task_struct *p)
@@ -3160,7 +3265,6 @@ static inline void inc_syscw(struct task_struct *tsk)
 {
 	tsk->ioac.syscw++;
 }
-
 static inline void inc_syscfs(struct task_struct *tsk)
 {
 	tsk->ioac.syscfs++;
@@ -3219,5 +3323,33 @@ static inline unsigned long rlimit_max(unsigned int limit)
 {
 	return task_rlimit_max(current, limit);
 }
+
+struct cpu_cycle_counter_cb {
+	u64 (*get_cpu_cycle_counter)(int cpu);
+	u32 (*get_cpu_cycles_max_per_us)(int cpu);
+};
+int register_cpu_cycle_counter_cb(struct cpu_cycle_counter_cb *cb);
+
+extern void save_pcpu_tick(int cpu);
+extern void restore_pcpu_tick(int cpu);
+#define SCHED_CPUFREQ_RT        (1U << 0)
+#define SCHED_CPUFREQ_DL        (1U << 1)
+#define SCHED_CPUFREQ_IOWAIT    (1U << 2)
+
+#ifdef CONFIG_CPU_FREQ
+struct update_util_data {
+	void (*func)(struct update_util_data *data, u64 time, unsigned int flags);
+};
+
+void cpufreq_add_update_util_hook(int cpu, struct update_util_data *data,
+                       void (*func)(struct update_util_data *data, u64 time,
+                                    unsigned int flags));
+void cpufreq_remove_update_util_hook(int cpu);
+#endif /* CONFIG_CPU_FREQ */
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+int do_stune_boost(char *st_name, int boost);
+int reset_stune_boost(char *st_name);
+#endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 #endif

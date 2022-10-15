@@ -6,6 +6,7 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/scatterlist.h>
+#include <linux/security.h>
 
 #include "blk.h"
 
@@ -97,7 +98,13 @@ void blk_recalc_rq_segments(struct request *rq)
 
 void blk_recount_segments(struct request_queue *q, struct bio *bio)
 {
-	unsigned short seg_cnt = bio_segments(bio);
+	unsigned short seg_cnt;
+
+	/* estimate segment number by bi_vcnt for non-cloned bio */
+	if (bio_flagged(bio, BIO_CLONED))
+		seg_cnt = bio_segments(bio);
+	else
+		seg_cnt = bio->bi_vcnt;
 
 	if (test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags) &&
 			(seg_cnt < queue_max_segments(q)))
@@ -277,6 +284,64 @@ int blk_rq_map_sg(struct request_queue *q, struct request *rq,
 }
 EXPORT_SYMBOL(blk_rq_map_sg);
 
+
+/*
+ * map a request to scatterlist without combining PHY CONT
+ * blocks, return number of sg entries setup. Caller
+ * must make sure sg can hold rq->nr_phys_segments entries
+ */
+int blk_rq_map_sg_no_cluster(struct request_queue *q, struct request *rq,
+		  struct scatterlist *sglist)
+{
+	struct bio_vec bvec, bvprv = { NULL };
+	struct req_iterator iter;
+	struct scatterlist *sg;
+	int nsegs, cluster = 0;
+
+	nsegs = 0;
+
+	/*
+	 * for each bio in rq
+	 */
+	sg = NULL;
+	rq_for_each_segment(bvec, rq, iter) {
+		__blk_segment_map_sg(q, &bvec, sglist, &bvprv, &sg,
+				     &nsegs, &cluster);
+	} /* segments in rq */
+
+
+	if (!sg)
+		return nsegs;
+
+	if (unlikely(rq->cmd_flags & REQ_COPY_USER) &&
+	    (blk_rq_bytes(rq) & q->dma_pad_mask)) {
+		unsigned int pad_len =
+			(q->dma_pad_mask & ~blk_rq_bytes(rq)) + 1;
+
+		sg->length += pad_len;
+		rq->extra_len += pad_len;
+	}
+
+	if (q->dma_drain_size && q->dma_drain_needed(rq)) {
+		if (rq->cmd_flags & REQ_WRITE)
+			memset(q->dma_drain_buffer, 0, q->dma_drain_size);
+
+		sg->page_link &= ~0x02;
+		sg = sg_next(sg);
+		sg_set_page(sg, virt_to_page(q->dma_drain_buffer),
+			    q->dma_drain_size,
+			    ((unsigned long)q->dma_drain_buffer) &
+			    (PAGE_SIZE - 1));
+		nsegs++;
+		rq->extra_len += q->dma_drain_size;
+	}
+
+	if (sg)
+		sg_mark_end(sg);
+
+	return nsegs;
+}
+EXPORT_SYMBOL(blk_rq_map_sg_no_cluster);
 /**
  * blk_bio_map_sg - map a bio to a scatterlist
  * @q: request_queue in question
@@ -600,6 +665,13 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 	    !blk_write_same_mergeable(rq->bio, bio))
 		return false;
 
+#ifdef CONFIG_JOURNAL_DATA_TAG
+	/* journal tagged bio can only be merged to REQ_META request */
+	if ((bio_flagged(bio, BIO_JMETA) || bio_flagged(bio, BIO_JOURNAL)) &&
+			!(rq->cmd_flags & REQ_META))
+		return false;
+#endif
+
 	if (q->queue_flags & (1 << QUEUE_FLAG_SG_GAPS)) {
 		struct bio_vec *bprev;
 
@@ -607,6 +679,10 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 		if (bvec_gap_to_prev(bprev, bio->bi_io_vec[0].bv_offset))
 			return false;
 	}
+
+	/* Don't merge bios of files with different encryption */
+	if (!security_allow_merge_bio(rq->bio, bio))
+		return false;
 
 	return true;
 }

@@ -35,6 +35,9 @@
 #include <asm/asm-uaccess.h>
 #include <asm/unistd.h>
 
+#ifdef CONFIG_RKP_CFP
+#include <asm/rkp_cfp.h>
+#endif
 /*
  * Context tracking subsystem.  Used to instrument transitions
  * between user and kernel mode.
@@ -116,18 +119,53 @@ alternative_else_nop_endif
 
 	.if	\el == 0
 	mrs	x21, sp_el0
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr_this_cpu	tsk, __entry_task, x20	// Ensure MDSCR_EL1.SS is clear,
+	ldr	x19, [tsk, #TSK_TI_FLAGS]	// since we can unmask debug
+#else
 	mov	tsk, sp
 	and	tsk, tsk, #~(THREAD_SIZE - 1)	// Ensure MDSCR_EL1.SS is clear,
 	ldr	x19, [tsk, #TI_FLAGS]		// since we can unmask debug
-	disable_step_tsk x19, x20		// exceptions when scheduling.
+#endif
+#ifdef CONFIG_RKP_CFP_ROPP
+#ifdef CONFIG_RKP_CFP_ROPP_HYPKEY
+	push	x0, x1
+	mov	x0, #0x1000
+	movk	x0, #0x8389, lsl #16
+	mov	x1, tsk
+	add	x1, x1, #TI_RRK
+	hvc	#0
+	pop	x0, x1
+#elif defined (CONFIG_RKP_CFP_ROPP_RANDOM_KEY)
+	mrs	RRK, CNTPCT_EL0
+	str	RRK, [tsk, #TI_RRK]
+#else
+	mov	RRK, #0
+	str	RRK, [tsk, #TI_RRK]
+#endif
+#endif
+        disable_step_tsk x19, x20		// exceptions when scheduling.
 	.else
+	/* From el1, don't change key as need for reencrypt*/
+#ifdef CONFIG_RKP_CFP_ROPP
+	get_thread_info tsk //Needed for load key
+	load_key 	tsk
+#endif
 	add	x21, sp, #S_FRAME_SIZE
 	get_thread_info tsk
 	/* Save the task's original addr_limit and set USER_DS (TASK_SIZE_64) */
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr	x20, [tsk, #TSK_TI_ADDR_LIMIT]
+#else
 	ldr	x20, [tsk, #TI_ADDR_LIMIT]
+#endif
 	str	x20, [sp, #S_ORIG_ADDR_LIMIT]
 	mov	x20, #TASK_SIZE_64
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
+#else
 	str	x20, [tsk, #TI_ADDR_LIMIT]
+#endif
 	ALTERNATIVE(nop, SET_PSTATE_UAO(0), ARM64_HAS_UAO, CONFIG_ARM64_UAO)
 	.endif /* \el == 0 */
 	mrs	x22, elr_el1
@@ -189,7 +227,11 @@ alternative_else_nop_endif
 	.if	\el != 0
 	/* Restore the task's original addr_limit. */
 	ldr	x20, [sp, #S_ORIG_ADDR_LIMIT]
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
+#else
 	str	x20, [tsk, #TI_ADDR_LIMIT]
+#endif
 
 	/* No need to restore UAO, it will be restored from SPSR_EL1 */
 	.endif
@@ -313,8 +355,12 @@ tsk	.req	x28		// current thread_info
  */
 
 	.align	11
+#ifdef CONFIG_RKP_CFP_JOPP
+VECTOR_ENTRY(vectors)
+#else
 ENTRY(vectors)
-	kernel_ventry	1, sync_invalid			// Synchronous EL1t
+#endif
+	kernel_ventry	1, sync_invalid		// Synchronous EL1t
 	kernel_ventry	1, irq_invalid			// IRQ EL1t
 	kernel_ventry	1, fiq_invalid			// FIQ EL1t
 	kernel_ventry	1, error_invalid		// Error EL1t
@@ -330,9 +376,9 @@ ENTRY(vectors)
 	kernel_ventry	0, error_invalid		// Error 64-bit EL0
 
 #ifdef CONFIG_COMPAT
-	kernel_ventry	0, sync_compat, 32		// Synchronous 32-bit EL0
-	kernel_ventry	0, irq_compat, 32		// IRQ 32-bit EL0
-	kernel_ventry	0, fiq_invalid_compat, 32	// FIQ 32-bit EL0
+	kernel_ventry	0, sync_compat, 32			// Synchronous 32-bit EL0
+	kernel_ventry	0, irq_compat, 32			// IRQ 32-bit EL0
+	kernel_ventry	0, fiq_invalid_compat, 32		// FIQ 32-bit EL0
 	kernel_ventry	0, error_invalid_compat, 32	// Error 32-bit EL0
 #else
 	kernel_ventry	0, sync_invalid, 32		// Synchronous 32-bit EL0
@@ -487,9 +533,17 @@ el1_irq:
 
 #ifdef CONFIG_PREEMPT
 	get_thread_info tsk
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr	w24, [tsk, #TSK_TI_PREEMPT]	// get preempt count
+#else
 	ldr	w24, [tsk, #TI_PREEMPT]		// get preempt count
+#endif
 	cbnz	w24, 1f				// preempt count != 0
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr	x0, [tsk, #TSK_TI_FLAGS]	// get flags
+#else
 	ldr	x0, [tsk, #TI_FLAGS]		// get flags
+#endif
 	tbz	x0, #TIF_NEED_RESCHED, 1f	// needs rescheduling?
 	bl	el1_preempt
 1:
@@ -504,7 +558,11 @@ ENDPROC(el1_irq)
 el1_preempt:
 	mov	x24, lr
 1:	bl	preempt_schedule_irq		// irq en/disable is done inside
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr	x0, [tsk, #TSK_TI_FLAGS]	// get new tasks TI_FLAGS
+#else
 	ldr	x0, [tsk, #TI_FLAGS]		// get new tasks TI_FLAGS
+#endif
 	tbnz	x0, #TIF_NEED_RESCHED, 1b	// needs rescheduling?
 	ret	x24
 #endif
@@ -603,13 +661,15 @@ el0_ia:
 	 * Instruction abort handling
 	 */
 	mrs	x26, far_el1
-	// enable interrupts before calling the main handler
-	enable_dbg_and_irq
+	enable_dbg
+#ifdef CONFIG_TRACE_IRQFLAGS
+	bl	trace_hardirqs_off
+#endif
 	ct_user_exit
 	mov	x0, x26
 	mov	x1, x25
 	mov	x2, sp
-	bl	do_mem_abort
+	bl	do_el0_ia_bp_hardening
 	b	ret_to_user
 el0_fpsimd_acc:
 	/*
@@ -621,6 +681,17 @@ el0_fpsimd_acc:
 	mov	x1, sp
 	bl	do_fpsimd_acc
 	b	ret_to_user
+el0_fpsimd_acc_compat:
+	/*
+	 * Floating Point or Advanced SIMD access
+	 */
+	enable_dbg
+	ct_user_exit
+	mov	x0, x25
+	mov	x1, sp
+	bl	do_fpsimd_acc_compat
+	b	ret_to_user
+
 el0_fpsimd_exc:
 	/*
 	 * Floating Point or Advanced SIMD exception
@@ -730,9 +801,40 @@ ENTRY(cpu_switch_to)
 	ldp	x27, x28, [x8], #16
 	ldp	x29, x9, [x8], #16
 	ldr	lr, [x8]
+#ifdef CONFIG_ARM64_REG_REBALANCE_ON_CTX_SW
+	orr	x13, x13, x13
+	orr	x14, x14, x14
+	orr	x15, x15, x15
+	orr	x16, x16, x16
+	orr	x17, x17, x17
+	orr	x18, x18, x18
+	orr	x19, x19, x19
+	orr	x20, x20, x20
+	orr	x21, x21, x21
+	mov	v0.16b, v0.16b
+	mov	v1.16b, v1.16b
+	mov	v2.16b, v2.16b
+	mov	v3.16b, v3.16b
+	mov	v4.16b, v4.16b
+	mov	v5.16b, v5.16b
+	mov	v6.16b, v6.16b
+	mov	v7.16b, v7.16b
+	mov	v8.16b, v8.16b
+	mov	v9.16b, v9.16b
+	mov	v10.16b, v10.16b
+	mov	v11.16b, v11.16b
+	mov	v12.16b, v12.16b
+	mov	v13.16b, v13.16b
+	mov	v14.16b, v14.16b
+	mov	v15.16b, v15.16b
+#endif
 	mov	sp, x9
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	msr	sp_el0, x1
+#else
 	and	x9, x9, #~(THREAD_SIZE - 1)
 	msr	sp_el0, x9
+#endif
 	ret
 ENDPROC(cpu_switch_to)
 
@@ -743,7 +845,11 @@ ENDPROC(cpu_switch_to)
 ret_fast_syscall:
 	disable_irq				// disable interrupts
 	str	x0, [sp, #S_X0]			// returned x0
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr	x1, [tsk, #TSK_TI_FLAGS]	// re-check for syscall tracing
+#else
 	ldr	x1, [tsk, #TI_FLAGS]		// re-check for syscall tracing
+#endif
 	and	x2, x1, #_TIF_SYSCALL_WORK
 	cbnz	x2, ret_fast_syscall_trace
 	and	x2, x1, #_TIF_WORK_MASK
@@ -778,7 +884,11 @@ work_resched:
  */
 ret_to_user:
 	disable_irq				// disable interrupts
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr	x1, [tsk, #TSK_TI_FLAGS]
+#else
 	ldr	x1, [tsk, #TI_FLAGS]
+#endif
 	and	x2, x1, #_TIF_WORK_MASK
 	cbnz	x2, work_pending
 	enable_step_tsk x1, x2
@@ -811,11 +921,38 @@ el0_svc_naked:					// compat entry point
 	enable_dbg_and_irq
 	ct_user_exit 1
 
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	ldr	x16, [tsk, #TSK_TI_FLAGS]	// check for syscall hooks
+#else
 	ldr	x16, [tsk, #TI_FLAGS]		// check for syscall hooks
+#endif
 	tst	x16, #_TIF_SYSCALL_WORK
 	b.ne	__sys_trace
 	cmp     scno, sc_nr                     // check upper syscall limit
 	b.hs	ni_sys
+#ifdef CONFIG_SECURITY_DEFEX
+/*
+ * Defex enter hook
+ */
+
+	ldr	x16, =defex_syscall_catch_enter
+	ldr	x16, [x16]
+	cmp	x16, xzr
+	b.eq	2f
+	mov	x0, scno
+	mov	x1, sp
+	blr	x16
+
+	cbnz	w0, ret_fast_syscall		// block this syscall?
+#	adr	lr, ret_fast_syscall		// return address (not needed here)
+
+	ldp	x0, x1, [sp]			// restore the syscall args
+	ldp	x2, x3, [sp, #S_X2]
+	ldp	x4, x5, [sp, #S_X4]
+	ldp	x6, x7, [sp, #S_X6]
+
+2:
+#endif
 	ldr	x16, [stbl, scno, lsl #3]	// address in the syscall table
 	blr	x16				// call sys_* routine
 	b	ret_fast_syscall
@@ -843,6 +980,23 @@ __sys_trace:
 	mov	x1, sp				// pointer to regs
 	cmp	scno, sc_nr			// check upper syscall limit
 	b.hs	__ni_sys_trace
+#ifdef CONFIG_SECURITY_DEFEX
+/*
+ * Defex enter hook
+ */
+
+	ldr	x16, =defex_syscall_catch_enter
+	ldr	x16, [x16]
+	cmp	x16, xzr
+	b.eq	3f
+	mov	x0, scno
+	mov	x1, sp
+	blr	x16
+
+	cbnz	w0, __sys_trace_return		// block this syscall?
+#	adr	lr, __sys_trace_return		// return address (not neede here)
+3:
+#endif
 	ldp	x0, x1, [sp]			// restore the syscall args
 	ldp	x2, x3, [sp, #S_X2]
 	ldp	x4, x5, [sp, #S_X4]
@@ -941,7 +1095,12 @@ __ni_sys_trace:
 	.endm
 
 	.align	11
+
+#ifdef CONFIG_RKP_CFP_JOPP
+VECTOR_ENTRY(tramp_vectors)
+#else
 ENTRY(tramp_vectors)
+#endif
 	.space	0x400
 
 	tramp_ventry

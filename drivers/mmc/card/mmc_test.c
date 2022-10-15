@@ -795,7 +795,7 @@ static int mmc_test_nonblock_transfer(struct mmc_test_card *test,
 	struct mmc_async_req *cur_areq = &test_areq[0].areq;
 	struct mmc_async_req *other_areq = &test_areq[1].areq;
 	int i;
-	int ret = RESULT_OK;
+	int ret;
 
 	test_areq[0].test = test;
 	test_areq[1].test = test;
@@ -2884,7 +2884,8 @@ static ssize_t mtf_test_write(struct file *file, const char __user *buf,
 	}
 
 #ifdef CONFIG_HIGHMEM
-	__free_pages(test->highmem, BUFFER_ORDER);
+	if (test->highmem)
+		__free_pages(test->highmem, BUFFER_ORDER);
 #endif
 	kfree(test->buffer);
 	kfree(test);

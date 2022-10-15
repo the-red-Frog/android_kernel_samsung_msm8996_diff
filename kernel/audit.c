@@ -69,6 +69,12 @@
 
 #include "audit.h"
 
+// [ SEC_SELINUX_PORTING_QUALCOMM
+#ifdef CONFIG_PROC_AVC 
+#include <linux/proc_avc.h>
+#endif
+// ] SEC_SELINUX_PORTING_QUALCOMM
+
 /* No auditing will take place until audit_initialized == AUDIT_INITIALIZED.
  * (Initialization happens after skb_init is called.) */
 #define AUDIT_DISABLED		-1
@@ -200,7 +206,6 @@ void audit_panic(const char *message)
 	case AUDIT_FAIL_SILENT:
 		break;
 	case AUDIT_FAIL_PRINTK:
-		if (printk_ratelimit())
 			pr_err("%s\n", message);
 		break;
 	case AUDIT_FAIL_PANIC:
@@ -271,7 +276,6 @@ void audit_log_lost(const char *message)
 	}
 
 	if (print) {
-		if (printk_ratelimit())
 			pr_warn("audit_lost=%u audit_rate_limit=%u audit_backlog_limit=%u\n",
 				atomic_read(&audit_lost),
 				audit_rate_limit,
@@ -392,11 +396,18 @@ static void audit_printk_skb(struct sk_buff *skb)
 	struct nlmsghdr *nlh = nlmsg_hdr(skb);
 	char *data = nlmsg_data(nlh);
 
+// [ SEC_SELINUX_PORTING_QUALCOMM
+#ifdef CONFIG_PROC_AVC
+	if (nlh->nlmsg_type != AUDIT_EOE && nlh->nlmsg_type != AUDIT_NETFILTER_CFG) {
+		sec_avc_log("%s\n", data);
+#else
 	if (nlh->nlmsg_type != AUDIT_EOE) {
 		if (printk_ratelimit())
 			pr_notice("type=%d %s\n", nlh->nlmsg_type, data);
 		else
 			audit_log_lost("printk limit exceeded");
+#endif
+// ] SEC_SELINUX_PORTING_QUALCOMM
 	}
 
 	audit_hold_skb(skb);
@@ -418,9 +429,20 @@ static void kauditd_send_skb(struct sk_buff *skb)
 		}
 		/* we might get lucky and get this in the next auditd */
 		audit_hold_skb(skb);
-	} else
+	} else{
+// [ SEC_SELINUX_PORTING_QUALCOMM
+#ifdef CONFIG_PROC_AVC
+		struct nlmsghdr *nlh = nlmsg_hdr(skb);
+		char *data = nlmsg_data(nlh);
+	
+		if (nlh->nlmsg_type != AUDIT_EOE && nlh->nlmsg_type != AUDIT_NETFILTER_CFG) {
+			sec_avc_log("%s\n", data);
+		}
+#endif
+// ] SEC_SELINUX_PORTING_QUALCOMM
 		/* drop the extra reference if sent ok */
 		consume_skb(skb);
+	}
 }
 
 /*
@@ -747,11 +769,13 @@ static void audit_log_feature_change(int which, u32 old_feature, u32 new_feature
 	audit_log_end(ab);
 }
 
-static int audit_set_feature(struct audit_features *uaf)
+static int audit_set_feature(struct sk_buff *skb)
 {
+	struct audit_features *uaf;
 	int i;
 
 	BUILD_BUG_ON(AUDIT_LAST_FEATURE + 1 > ARRAY_SIZE(audit_feature_names));
+	uaf = nlmsg_data(nlmsg_hdr(skb));
 
 	/* if there is ever a version 2 we should handle that here */
 
@@ -807,7 +831,6 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 {
 	u32			seq;
 	void			*data;
-	int			data_len;
 	int			err;
 	struct audit_buffer	*ab;
 	u16			msg_type = nlh->nlmsg_type;
@@ -831,7 +854,6 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	}
 	seq  = nlh->nlmsg_seq;
 	data = nlmsg_data(nlh);
-	data_len = nlmsg_len(nlh);
 
 	switch (msg_type) {
 	case AUDIT_GET: {
@@ -853,7 +875,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 		struct audit_status	s;
 		memset(&s, 0, sizeof(s));
 		/* guard against past and future API changes */
-		memcpy(&s, data, min_t(size_t, sizeof(s), data_len));
+		memcpy(&s, data, min_t(size_t, sizeof(s), nlmsg_len(nlh)));
 		if (s.mask & AUDIT_STATUS_ENABLED) {
 			err = audit_set_enabled(s.enabled);
 			if (err < 0)
@@ -909,9 +931,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 			return err;
 		break;
 	case AUDIT_SET_FEATURE:
-		if (data_len < sizeof(struct audit_features))
-			return -EINVAL;
-		err = audit_set_feature(data);
+		err = audit_set_feature(skb);
 		if (err)
 			return err;
 		break;
@@ -920,14 +940,9 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	case AUDIT_FIRST_USER_MSG2 ... AUDIT_LAST_USER_MSG2:
 		if (!audit_enabled && msg_type != AUDIT_USER_AVC)
 			return 0;
-		/* exit early if there isn't at least one character to print */
-		if (data_len < 2)
-			return -EINVAL;
 
 		err = audit_filter_user(msg_type);
 		if (err == 1) { /* match or error */
-			char *str = data;
-
 			err = 0;
 			if (msg_type == AUDIT_USER_TTY) {
 				err = tty_audit_push_current();
@@ -936,17 +951,19 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 			}
 			mutex_unlock(&audit_cmd_mutex);
 			audit_log_common_recv_msg(&ab, msg_type);
-			if (msg_type != AUDIT_USER_TTY) {
-				/* ensure NULL termination */
-				str[data_len - 1] = '\0';
+			if (msg_type != AUDIT_USER_TTY)
 				audit_log_format(ab, " msg='%.*s'",
 						 AUDIT_MESSAGE_TEXT_MAX,
-						 str);
-			} else {
+						 (char *)data);
+			else {
+				int size;
+
 				audit_log_format(ab, " data=");
-				if (data_len > 0 && str[data_len - 1] == '\0')
-					data_len--;
-				audit_log_n_untrustedstring(ab, str, data_len);
+				size = nlmsg_len(nlh);
+				if (size > 0 &&
+				    ((unsigned char *)data)[size - 1] == '\0')
+					size--;
+				audit_log_n_untrustedstring(ab, data, size);
 			}
 			audit_set_portid(ab, NETLINK_CB(skb).portid);
 			audit_log_end(ab);
@@ -955,7 +972,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 		break;
 	case AUDIT_ADD_RULE:
 	case AUDIT_DEL_RULE:
-		if (data_len < sizeof(struct audit_rule_data))
+		if (nlmsg_len(nlh) < sizeof(struct audit_rule_data))
 			return -EINVAL;
 		if (audit_enabled == AUDIT_LOCKED) {
 			audit_log_common_recv_msg(&ab, AUDIT_CONFIG_CHANGE);
@@ -964,7 +981,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 			return -EPERM;
 		}
 		err = audit_rule_change(msg_type, NETLINK_CB(skb).portid,
-					   seq, data, data_len);
+					   seq, data, nlmsg_len(nlh));
 		break;
 	case AUDIT_LIST_RULES:
 		err = audit_list_rules_send(skb, seq);
@@ -978,7 +995,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	case AUDIT_MAKE_EQUIV: {
 		void *bufp = data;
 		u32 sizes[2];
-		size_t msglen = data_len;
+		size_t msglen = nlmsg_len(nlh);
 		char *old, *new;
 
 		err = -EINVAL;
@@ -1055,7 +1072,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 
 		memset(&s, 0, sizeof(s));
 		/* guard against past and future API changes */
-		memcpy(&s, data, min_t(size_t, sizeof(s), data_len));
+		memcpy(&s, data, min_t(size_t, sizeof(s), nlmsg_len(nlh)));
 		/* check if new data is valid */
 		if ((s.enabled != 0 && s.enabled != 1) ||
 		    (s.log_passwd != 0 && s.log_passwd != 1))
@@ -1397,7 +1414,7 @@ struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask,
 					continue;
 			}
 		}
-		if (audit_rate_check() && printk_ratelimit())
+		if (audit_rate_check())
 			pr_warn("audit_backlog=%d > audit_backlog_limit=%d\n",
 				skb_queue_len(&audit_skb_queue),
 				audit_backlog_limit);

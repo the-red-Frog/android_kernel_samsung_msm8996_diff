@@ -73,7 +73,9 @@ startup_64:
 	subq	$_text - __START_KERNEL_map, %rbp
 
 	/* Is the address not 2M aligned? */
-	testl	$~PMD_PAGE_MASK, %ebp
+	movq	%rbp, %rax
+	andl	$~PMD_PAGE_MASK, %eax
+	testl	%eax, %eax
 	jnz	bad_address
 
 	/*
@@ -519,3 +521,4 @@ ENTRY(phys_base)
 	__PAGE_ALIGNED_BSS
 NEXT_PAGE(empty_zero_page)
 	.skip PAGE_SIZE
+

@@ -29,13 +29,7 @@ static DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
 
 unsigned long scale_cpu_capacity(struct sched_domain *sd, int cpu)
 {
-#ifdef CONFIG_CPU_FREQ
-	unsigned long max_freq_scale = cpufreq_scale_max_freq_capacity(cpu);
-
-	return per_cpu(cpu_scale, cpu) * max_freq_scale >> SCHED_CAPACITY_SHIFT;
-#else
 	return per_cpu(cpu_scale, cpu);
-#endif
 }
 
 static void set_capacity_scale(unsigned int cpu, unsigned long capacity)
@@ -258,6 +252,11 @@ const struct cpumask *cpu_coregroup_mask(int cpu)
 	return &cpu_topology[cpu].core_sibling;
 }
 
+static int cpu_cpu_flags(void)
+{
+	return SD_ASYM_CPUCAPACITY;
+}
+
 static inline int cpu_corepower_flags(void)
 {
 	return SD_SHARE_PKG_RESOURCES  | SD_SHARE_POWERDOMAIN | \
@@ -268,7 +267,7 @@ static struct sched_domain_topology_level arm64_topology[] = {
 #ifdef CONFIG_SCHED_MC
 	{ cpu_coregroup_mask, cpu_corepower_flags, cpu_core_energy, SD_INIT_NAME(MC) },
 #endif
-	{ cpu_cpu_mask, NULL, cpu_cluster_energy, SD_INIT_NAME(DIE) },
+	{ cpu_cpu_mask, cpu_cpu_flags, cpu_cluster_energy, SD_INIT_NAME(DIE) },
 	{ NULL, },
 };
 
@@ -368,16 +367,22 @@ static void __init reset_cpu_topology(void)
 
 void __init init_cpu_topology(void)
 {
+	int cpu;
+
 	reset_cpu_topology();
 
 	/*
 	 * Discard anything that was parsed if we hit an error so we
 	 * don't use partial information.
 	 */
-	if (parse_dt_topology())
+	if (parse_dt_topology()) {
 		reset_cpu_topology();
-	else
+	} else {
+		for_each_possible_cpu(cpu)
+			update_siblings_masks(cpu);
+
 		set_sched_topology(arm64_topology);
+	}
 
 	init_sched_energy_costs();
 }

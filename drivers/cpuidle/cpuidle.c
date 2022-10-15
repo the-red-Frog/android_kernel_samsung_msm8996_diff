@@ -20,6 +20,7 @@
 #include <linux/hrtimer.h>
 #include <linux/module.h>
 #include <linux/suspend.h>
+#include <linux/tick.h>
 #include <trace/events/power.h>
 
 #include "cpuidle.h"
@@ -43,6 +44,12 @@ void disable_cpuidle(void)
 	off = 1;
 }
 
+bool cpuidle_not_available(struct cpuidle_driver *drv,
+			   struct cpuidle_device *dev)
+{
+	return off || !initialized || !drv || !dev || !dev->enabled;
+}
+
 /**
  * cpuidle_play_dead - cpu off-lining
  *
@@ -58,29 +65,25 @@ int cpuidle_play_dead(void)
 		return -ENODEV;
 
 	/* Find lowest-power state that supports long-term idle */
-	for (i = drv->state_count - 1; i >= CPUIDLE_DRIVER_STATE_START; i--)
+	for (i = drv->state_count - 1; i >= 0; i--)
 		if (drv->states[i].enter_dead)
 			return drv->states[i].enter_dead(dev, i);
 
 	return -ENODEV;
 }
 
-/**
- * cpuidle_find_deepest_state - Find deepest state meeting specific conditions.
- * @drv: cpuidle driver for the given CPU.
- * @dev: cpuidle device for the given CPU.
- */
-static int cpuidle_find_deepest_state(struct cpuidle_driver *drv,
-				      struct cpuidle_device *dev)
+static int find_deepest_state(struct cpuidle_driver *drv,
+			      struct cpuidle_device *dev, bool freeze)
 {
 	unsigned int latency_req = 0;
-	int i, ret = CPUIDLE_DRIVER_STATE_START - 1;
+	int i, ret = -ENXIO;
 
-	for (i = CPUIDLE_DRIVER_STATE_START; i < drv->state_count; i++) {
+	for (i = 0; i < drv->state_count; i++) {
 		struct cpuidle_state *s = &drv->states[i];
 		struct cpuidle_state_usage *su = &dev->states_usage[i];
 
-		if (s->disabled || su->disable || s->exit_latency <= latency_req)
+		if (s->disabled || su->disable || s->exit_latency <= latency_req
+		    || (freeze && !s->enter_freeze))
 			continue;
 
 		latency_req = s->exit_latency;
@@ -90,24 +93,62 @@ static int cpuidle_find_deepest_state(struct cpuidle_driver *drv,
 }
 
 /**
- * cpuidle_enter_freeze - Enter an idle state suitable for suspend-to-idle.
- *
- * Find the deepest state available and enter it.
+ * cpuidle_find_deepest_state - Find the deepest available idle state.
+ * @drv: cpuidle driver for the given CPU.
+ * @dev: cpuidle device for the given CPU.
  */
-void cpuidle_enter_freeze(void)
+int cpuidle_find_deepest_state(struct cpuidle_driver *drv,
+			       struct cpuidle_device *dev)
 {
-	struct cpuidle_device *dev = __this_cpu_read(cpuidle_devices);
-	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
+	return find_deepest_state(drv, dev, false);
+}
+
+static void enter_freeze_proper(struct cpuidle_driver *drv,
+				struct cpuidle_device *dev, int index)
+{
+	/*
+	 * trace_suspend_resume() called by tick_freeze() for the last CPU
+	 * executing it contains RCU usage regarded as invalid in the idle
+	 * context, so tell RCU about that.
+	 */
+	RCU_NONIDLE(tick_freeze());
+	/*
+	 * The state used here cannot be a "coupled" one, because the "coupled"
+	 * cpuidle mechanism enables interrupts and doing that with timekeeping
+	 * suspended is generally unsafe.
+	 */
+	drv->states[index].enter_freeze(dev, drv, index);
+	WARN_ON(!irqs_disabled());
+	/*
+	 * timekeeping_resume() that will be called by tick_unfreeze() for the
+	 * first CPU executing it calls functions containing RCU read-side
+	 * critical sections, so tell RCU about that.
+	 */
+	RCU_NONIDLE(tick_unfreeze());
+}
+
+/**
+ * cpuidle_enter_freeze - Enter an idle state suitable for suspend-to-idle.
+ * @drv: cpuidle driver for the given CPU.
+ * @dev: cpuidle device for the given CPU.
+ *
+ * If there are states with the ->enter_freeze callback, find the deepest of
+ * them and enter it with frozen tick.
+ */
+int cpuidle_enter_freeze(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+{
 	int index;
 
-	index = cpuidle_find_deepest_state(drv, dev);
+	/*
+	 * Find the deepest state with ->enter_freeze present, which guarantees
+	 * that interrupts won't be enabled when it exits and allows the tick to
+	 * be frozen safely.
+	 */
+	index = find_deepest_state(drv, dev, true);
 	if (index >= 0)
-		cpuidle_enter(drv, dev, index);
-	else
-		arch_cpu_idle();
+		enter_freeze_proper(drv, dev, index);
 
-	/* Interrupts are enabled again here. */
-	local_irq_disable();
+	return index;
 }
 
 /**
@@ -172,12 +213,6 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
  */
 int cpuidle_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 {
-	if (off || !initialized)
-		return -ENODEV;
-
-	if (!drv || !dev || !dev->enabled)
-		return -EBUSY;
-
 	return cpuidle_curr_governor->select(drv, dev);
 }
 
@@ -209,7 +244,7 @@ int cpuidle_enter(struct cpuidle_driver *drv, struct cpuidle_device *dev,
  */
 void cpuidle_reflect(struct cpuidle_device *dev, int index)
 {
-	if (cpuidle_curr_governor->reflect)
+	if (cpuidle_curr_governor->reflect && index >= 0)
 		cpuidle_curr_governor->reflect(dev, index);
 }
 
@@ -544,16 +579,28 @@ EXPORT_SYMBOL_GPL(cpuidle_register);
 
 #ifdef CONFIG_SMP
 
+static void smp_callback(void *v)
+{
+	/* we already woke the CPU up, nothing more to do */
+}
+
 /*
  * This function gets called when a part of the kernel has a new latency
- * requirement.  This means we need to get all processors out of their C-state,
- * and then recalculate a new suitable C-state. Just do a cross-cpu IPI; that
- * wakes them all right up.
+ * requirement.  This means we need to get only those processors out of their
+ * C-state for which qos requirement is changed, and then recalculate a new
+ * suitable C-state. Just do a cross-cpu IPI; that wakes them all right up.
  */
 static int cpuidle_latency_notify(struct notifier_block *b,
 		unsigned long l, void *v)
 {
-	wake_up_all_idle_cpus();
+	const struct cpumask *cpus;
+
+	cpus = v ?: cpu_online_mask;
+
+	preempt_disable();
+	smp_call_function_many(cpus, smp_callback, NULL, 1);
+	preempt_enable();
+
 	return NOTIFY_OK;
 }
 

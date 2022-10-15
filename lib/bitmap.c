@@ -12,7 +12,6 @@
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/bug.h>
-#include <linux/slab.h>
 #include <asm/uaccess.h>
 
 /*
@@ -326,6 +325,31 @@ void bitmap_clear(unsigned long *map, unsigned int start, int len)
 	}
 }
 EXPORT_SYMBOL(bitmap_clear);
+
+/**
+ * bitmap_find_next_zero_area_and_size - find a contiguous aligned zero area
+ * @map: The address to base the search on
+ * @size: The bitmap size in bits
+ * @start: The bitnumber to start searching at
+ * @nr: The number of zeroed bits we've found
+ */
+unsigned long bitmap_find_next_zero_area_and_size(unsigned long *map,
+					     unsigned long size,
+					     unsigned long start,
+					     unsigned int *nr)
+{
+	unsigned long index, i;
+
+	*nr = 0;
+	index = find_next_zero_bit(map, size, start);
+
+	if (index >= size)
+		return index;
+	i = find_next_bit(map, size, index);
+	*nr = i - index;
+	return index;
+}
+EXPORT_SYMBOL(bitmap_find_next_zero_area_and_size);
 
 /**
  * bitmap_find_next_zero_area_off - find a contiguous aligned zero area
@@ -1193,22 +1217,3 @@ void bitmap_copy_le(void *dst, const unsigned long *src, int nbits)
 	}
 }
 EXPORT_SYMBOL(bitmap_copy_le);
-
-unsigned long *bitmap_alloc(unsigned int nbits, gfp_t flags)
-{
-	return kmalloc_array(BITS_TO_LONGS(nbits), sizeof(unsigned long),
-			     flags);
-}
-EXPORT_SYMBOL(bitmap_alloc);
-
-unsigned long *bitmap_zalloc(unsigned int nbits, gfp_t flags)
-{
-	return bitmap_alloc(nbits, flags | __GFP_ZERO);
-}
-EXPORT_SYMBOL(bitmap_zalloc);
-
-void bitmap_free(const unsigned long *bitmap)
-{
-	kfree(bitmap);
-}
-EXPORT_SYMBOL(bitmap_free);

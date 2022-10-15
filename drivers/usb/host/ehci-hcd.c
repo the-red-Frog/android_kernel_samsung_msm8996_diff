@@ -526,6 +526,8 @@ static int ehci_init(struct usb_hcd *hcd)
 	hw->hw_alt_next = QTD_NEXT(ehci, ehci->async->dummy->qtd_dma);
 
 	/* clear interrupt enables, set irq latency */
+	log2_irq_thresh = ehci->log2_irq_thresh;
+
 	if (log2_irq_thresh < 0 || log2_irq_thresh > 6)
 		log2_irq_thresh = 0;
 	temp = 1 << (16 + log2_irq_thresh);
@@ -568,7 +570,6 @@ static int ehci_run (struct usb_hcd *hcd)
 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
 	u32			temp;
 	u32			hcc_params;
-	int			rc;
 
 	hcd->uses_new_polling = 1;
 
@@ -624,20 +625,9 @@ static int ehci_run (struct usb_hcd *hcd)
 	down_write(&ehci_cf_port_reset_rwsem);
 	ehci->rh_state = EHCI_RH_RUNNING;
 	ehci_writel(ehci, FLAG_CF, &ehci->regs->configured_flag);
-
-	/* Wait until HC become operational */
 	ehci_readl(ehci, &ehci->regs->command);	/* unblock posted writes */
 	msleep(5);
-	rc = ehci_handshake(ehci, &ehci->regs->status, STS_HALT, 0, 100 * 1000);
-
 	up_write(&ehci_cf_port_reset_rwsem);
-
-	if (rc) {
-		ehci_err(ehci, "USB %x.%x, controller refused to start: %d\n",
-			 ((ehci->sbrn & 0xf0)>>4), (ehci->sbrn & 0x0f), rc);
-		return rc;
-	}
-
 	ehci->last_periodic_enable = ktime_get_real();
 
 	temp = HC_VERSION(ehci, ehci_readl(ehci, &ehci->caps->hc_capbase));
@@ -790,6 +780,12 @@ static irqreturn_t ehci_irq (struct usb_hcd *hcd)
 			pstatus = ehci_readl(ehci,
 					 &ehci->regs->port_status[i]);
 
+			/*set RS bit in case of remote wakeup*/
+			if (ehci_is_TDI(ehci) && !(cmd & CMD_RUN) &&
+					(pstatus & PORT_SUSPEND))
+				ehci_writel(ehci, cmd | CMD_RUN,
+					&ehci->regs->command);
+
 			if (pstatus & PORT_OWNER)
 				continue;
 			if (!(test_bit(i, &ehci->suspended_ports) &&
@@ -815,6 +811,10 @@ static irqreturn_t ehci_irq (struct usb_hcd *hcd)
 	/* PCI errors [4.15.2.4] */
 	if (unlikely ((status & STS_FATAL) != 0)) {
 		ehci_err(ehci, "fatal error\n");
+		if (hcd->driver->dump_regs) {
+			hcd->driver->dump_regs(hcd);
+			panic("System error\n");
+		}
 		dbg_cmd(ehci, "fatal", cmd);
 		dbg_status(ehci, "fatal", status);
 dead:
@@ -1006,7 +1006,7 @@ idle_timeout:
 		/* caller was supposed to have unlinked any requests;
 		 * that's not our job.  just leak this memory.
 		 */
-		ehci_err (ehci, "qh %p (#%02x) state %d%s\n",
+		ehci_err (ehci, "qh %pK (#%02x) state %d%s\n",
 			qh, ep->desc.bEndpointAddress, qh->qh_state,
 			list_empty (&qh->qtd_list) ? "" : "(has tds)");
 		break;
@@ -1243,8 +1243,14 @@ void ehci_init_driver(struct hc_driver *drv,
 
 	if (over) {
 		drv->hcd_priv_size += over->extra_priv_size;
+		if (over->flags)
+			drv->flags = over->flags;
 		if (over->reset)
 			drv->reset = over->reset;
+		if (over->bus_suspend)
+			drv->bus_suspend = over->bus_suspend;
+		if (over->bus_resume)
+			drv->bus_resume = over->bus_resume;
 	}
 }
 EXPORT_SYMBOL_GPL(ehci_init_driver);
@@ -1308,6 +1314,11 @@ MODULE_LICENSE ("GPL");
 #ifdef CONFIG_MIPS_SEAD3
 #include "ehci-sead3.c"
 #define	PLATFORM_DRIVER		ehci_hcd_sead3_driver
+#endif
+
+#ifdef CONFIG_USB_EHCI_MSM_HSIC
+#include "ehci-msm-hsic.c"
+#define PLATFORM_DRIVER         ehci_msm_hsic_driver
 #endif
 
 static int __init ehci_hcd_init(void)

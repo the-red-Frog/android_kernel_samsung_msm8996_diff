@@ -1,10 +1,14 @@
-#
 # Security configuration
 #
 
 menu "Security options"
 
 source security/keys/Kconfig
+
+if ARCH_MSM
+source security/pfe/Kconfig
+endif
+
 
 config SECURITY_DMESG_RESTRICT
 	bool "Restrict unprivileged access to the kernel syslog"
@@ -171,8 +175,13 @@ source security/smack/Kconfig
 source security/tomoyo/Kconfig
 source security/apparmor/Kconfig
 source security/yama/Kconfig
+source security/mstdrv/Kconfig
 
 source security/integrity/Kconfig
+source security/samsung/defex_lsm/Kconfig
+source security/tz_iccc/Kconfig
+source security/knox_test/Kconfig
+source security/samsung/dsms/Kconfig
 
 choice
 	prompt "Default security module"

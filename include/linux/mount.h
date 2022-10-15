@@ -65,9 +65,21 @@ struct mnt_namespace;
 struct vfsmount {
 	struct dentry *mnt_root;	/* root of the mounted tree */
 	struct super_block *mnt_sb;	/* pointer to superblock */
+#ifdef CONFIG_RKP_NS_PROT
+	struct mount *bp_mount;	/* pointer to mount*/
+#endif
 	int mnt_flags;
 	void *data;
 };
+
+#ifdef CONFIG_RKP_NS_PROT
+struct vfsmount_offset {
+	u64 bp_mount_offset;
+	u64 mnt_sb_offset;
+	u64 mnt_flags_offset;
+	u64 data_offset;
+};
+#endif
 
 struct file; /* forward dec */
 struct path;
@@ -94,7 +106,5 @@ extern void mnt_set_expiry(struct vfsmount *mnt, struct list_head *expiry_list);
 extern void mark_mounts_for_expiry(struct list_head *mounts);
 
 extern dev_t name_to_dev_t(const char *name);
-
-extern unsigned int sysctl_mount_max;
 
 #endif /* _LINUX_MOUNT_H */

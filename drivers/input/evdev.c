@@ -190,6 +190,11 @@ static void evdev_pass_values(struct evdev_client *client,
 		__pass_event(client, &event);
 		if (v->type == EV_SYN && v->code == SYN_REPORT)
 			wakeup = true;
+#ifdef CONFIG_USB_HMT_SAMSUNG_INPUT
+		if (v->type== EV_KEY && v->code >= KEY_HMT_CMD_START)
+			pr_info("%s type:KEY code:0x%x value:%x\n", __func__,
+					v->code, v->value);
+#endif
 	}
 
 	spin_unlock(&client->buffer_lock);
@@ -241,6 +246,20 @@ static int evdev_fasync(int fd, struct file *file, int on)
 	struct evdev_client *client = file->private_data;
 
 	return fasync_helper(fd, file, on, &client->fasync);
+}
+
+static int evdev_flush(struct file *file, fl_owner_t id)
+{
+	struct evdev_client *client = file->private_data;
+	struct evdev *evdev = client->evdev;
+
+	mutex_lock(&evdev->mutex);
+
+	if (evdev->exist && !client->revoked)
+		input_flush_device(&evdev->handle, file);
+
+	mutex_unlock(&evdev->mutex);
+	return 0;
 }
 
 static void evdev_free(struct device *dev)
@@ -355,10 +374,6 @@ static int evdev_release(struct inode *inode, struct file *file)
 	struct evdev *evdev = client->evdev;
 
 	mutex_lock(&evdev->mutex);
-
-	if (evdev->exist && !client->revoked)
-		input_flush_device(&evdev->handle, file);
-
 	evdev_ungrab(evdev, client);
 	mutex_unlock(&evdev->mutex);
 
@@ -1108,6 +1123,7 @@ static const struct file_operations evdev_fops = {
 	.compat_ioctl	= evdev_ioctl_compat,
 #endif
 	.fasync		= evdev_fasync,
+	.flush		= evdev_flush,
 	.llseek		= no_llseek,
 };
 

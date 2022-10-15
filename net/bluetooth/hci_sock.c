@@ -131,7 +131,7 @@ void hci_send_to_sock(struct hci_dev *hdev, struct sk_buff *skb)
 	struct sock *sk;
 	struct sk_buff *skb_copy = NULL;
 
-	BT_DBG("hdev %p len %d", hdev, skb->len);
+	BT_DBG("hdev %pK len %d", hdev, skb->len);
 
 	read_lock(&hci_sk_list.lock);
 
@@ -226,7 +226,7 @@ void hci_send_to_monitor(struct hci_dev *hdev, struct sk_buff *skb)
 	if (!atomic_read(&monitor_promisc))
 		return;
 
-	BT_DBG("hdev %p len %d", hdev, skb->len);
+	BT_DBG("hdev %pK len %d", hdev, skb->len);
 
 	switch (bt_cb(skb)->pkt_type) {
 	case HCI_COMMAND_PKT:
@@ -438,7 +438,7 @@ void hci_sock_dev_event(struct hci_dev *hdev, int event)
 		/* Detach sockets from device */
 		read_lock(&hci_sk_list.lock);
 		sk_for_each(sk, &hci_sk_list.head) {
-			lock_sock(sk);
+			bh_lock_sock_nested(sk);
 			if (hci_pi(sk)->hdev == hdev) {
 				hci_pi(sk)->hdev = NULL;
 				sk->sk_err = EPIPE;
@@ -447,7 +447,7 @@ void hci_sock_dev_event(struct hci_dev *hdev, int event)
 
 				hci_dev_put(hdev);
 			}
-			release_sock(sk);
+			bh_unlock_sock(sk);
 		}
 		read_unlock(&hci_sk_list.lock);
 	}
@@ -458,17 +458,18 @@ static int hci_sock_release(struct socket *sock)
 	struct sock *sk = sock->sk;
 	struct hci_dev *hdev;
 
-	BT_DBG("sock %p sk %p", sock, sk);
+	BT_DBG("sock %pK sk %pK", sock, sk);
 
 	if (!sk)
 		return 0;
+
+	hdev = hci_pi(sk)->hdev;
 
 	if (hci_pi(sk)->channel == HCI_CHANNEL_MONITOR)
 		atomic_dec(&monitor_promisc);
 
 	bt_sock_unlink(&hci_sk_list, sk);
 
-	hdev = hci_pi(sk)->hdev;
 	if (hdev) {
 		if (hci_pi(sk)->channel == HCI_CHANNEL_USER) {
 			mgmt_index_added(hdev);
@@ -648,7 +649,7 @@ static int hci_sock_bind(struct socket *sock, struct sockaddr *addr,
 	struct hci_dev *hdev = NULL;
 	int len, err = 0;
 
-	BT_DBG("sock %p sk %p", sock, sk);
+	BT_DBG("sock %pK sk %pK", sock, sk);
 
 	if (!addr)
 		return -EINVAL;
@@ -790,7 +791,7 @@ static int hci_sock_getname(struct socket *sock, struct sockaddr *addr,
 	struct hci_dev *hdev;
 	int err = 0;
 
-	BT_DBG("sock %p sk %p", sock, sk);
+	BT_DBG("sock %pK sk %pK", sock, sk);
 
 	if (peer)
 		return -EOPNOTSUPP;
@@ -858,7 +859,7 @@ static int hci_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
 	struct sk_buff *skb;
 	int copied, err;
 
-	BT_DBG("sock %p, sk %p", sock, sk);
+	BT_DBG("sock %pK, sk %pK", sock, sk);
 
 	if (flags & (MSG_OOB))
 		return -EOPNOTSUPP;
@@ -903,7 +904,7 @@ static int hci_sock_sendmsg(struct kiocb *iocb, struct socket *sock,
 	struct sk_buff *skb;
 	int err;
 
-	BT_DBG("sock %p sk %p", sock, sk);
+	BT_DBG("sock %pK sk %pK", sock, sk);
 
 	if (msg->msg_flags & MSG_OOB)
 		return -EOPNOTSUPP;
@@ -1023,7 +1024,7 @@ static int hci_sock_setsockopt(struct socket *sock, int level, int optname,
 	struct sock *sk = sock->sk;
 	int err = 0, opt = 0;
 
-	BT_DBG("sk %p, opt %d", sk, optname);
+	BT_DBG("sk %pK, opt %d", sk, optname);
 
 	lock_sock(sk);
 
@@ -1106,7 +1107,7 @@ static int hci_sock_getsockopt(struct socket *sock, int level, int optname,
 	struct sock *sk = sock->sk;
 	int len, opt, err = 0;
 
-	BT_DBG("sk %p, opt %d", sk, optname);
+	BT_DBG("sk %pK, opt %d", sk, optname);
 
 	if (get_user(len, optlen))
 		return -EFAULT;
@@ -1196,7 +1197,7 @@ static int hci_sock_create(struct net *net, struct socket *sock, int protocol,
 {
 	struct sock *sk;
 
-	BT_DBG("sock %p", sock);
+	BT_DBG("sock %pK", sock);
 
 	if (sock->type != SOCK_RAW)
 		return -ESOCKTNOSUPPORT;

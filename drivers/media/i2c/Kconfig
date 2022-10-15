@@ -218,6 +218,18 @@ config VIDEO_ADV7842
 	  To compile this driver as a module, choose M here: the
 	  module will be called adv7842.
 
+config VIDEO_ADV7481
+	tristate "Analog Devices ADV7481 decoder"
+	depends on VIDEO_V4L2 && I2C && VIDEO_V4L2_SUBDEV_API && MEDIA_CONTROLLER
+	---help---
+	  Support for the Analog Devices ADV7481 video decoder.
+
+	  This is a Analog Devices Component/Graphics/SD Digitizer
+	  with HDMI Receiver.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called adv7481.
+
 config VIDEO_BT819
 	tristate "BT819A VideoStream decoder"
 	depends on VIDEO_V4L2 && I2C
@@ -591,7 +603,6 @@ config VIDEO_S5K6A3
 config VIDEO_S5K4ECGX
         tristate "Samsung S5K4ECGX sensor support"
         depends on I2C && VIDEO_V4L2 && VIDEO_V4L2_SUBDEV_API
-	select CRC32
         ---help---
           This is a V4L2 sensor-level driver for Samsung S5K4ECGX 5M
           camera sensor with an embedded SoC image signal processor.
@@ -710,6 +721,7 @@ endmenu
 menu "Sensors used on soc_camera driver"
 
 if SOC_CAMERA
+
 	source "drivers/media/i2c/soc_camera/Kconfig"
 endif
 

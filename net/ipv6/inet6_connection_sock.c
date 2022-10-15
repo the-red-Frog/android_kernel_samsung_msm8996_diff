@@ -88,7 +88,7 @@ struct dst_entry *inet6_csk_route_req(struct sock *sk,
 	fl6->flowi6_uid = sk->sk_uid;
 	security_req_classify_flow(req, flowi6_to_flowi(fl6));
 
-	dst = ip6_dst_lookup_flow(sock_net(sk), sk, fl6, final_p);
+	dst = ip6_dst_lookup_flow(sk, fl6, final_p);
 	if (IS_ERR(dst))
 		return NULL;
 
@@ -98,8 +98,11 @@ struct dst_entry *inet6_csk_route_req(struct sock *sk,
 /*
  * request_sock (formerly open request) hash tables.
  */
-static u32 inet6_synq_hash(const struct in6_addr *raddr, const __be16 rport,
-			   const u32 rnd, const u32 synq_hsize)
+#ifndef CONFIG_MPTCP
+static
+#endif
+u32 inet6_synq_hash(const struct in6_addr *raddr, const __be16 rport,
+		    const u32 rnd, const u32 synq_hsize)
 {
 	u32 c;
 
@@ -218,7 +221,7 @@ static struct dst_entry *inet6_csk_route_socket(struct sock *sk,
 
 	dst = __inet6_csk_dst_check(sk, np->dst_cookie);
 	if (!dst) {
-		dst = ip6_dst_lookup_flow(sock_net(sk), sk, fl6, final_p);
+		dst = ip6_dst_lookup_flow(sk, fl6, final_p);
 
 		if (!IS_ERR(dst))
 			__inet6_csk_dst_store(sk, dst, NULL, NULL);

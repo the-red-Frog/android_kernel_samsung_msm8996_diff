@@ -291,7 +291,7 @@ static int sr9700_set_mac_address(struct net_device *netdev, void *p)
 	struct sockaddr *addr = p;
 
 	if (!is_valid_ether_addr(addr->sa_data)) {
-		netdev_err(netdev, "not setting invalid mac address %pM\n",
+		netdev_err(netdev, "not setting invalid mac address %pKM\n",
 			   addr->sa_data);
 		return -EINVAL;
 	}
@@ -456,9 +456,14 @@ static struct sk_buff *sr9700_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
 
 	len = skb->len;
 
-	if (skb_cow_head(skb, SR_TX_OVERHEAD)) {
+	if (skb_headroom(skb) < SR_TX_OVERHEAD) {
+		struct sk_buff *skb2;
+
+		skb2 = skb_copy_expand(skb, SR_TX_OVERHEAD, 0, flags);
 		dev_kfree_skb_any(skb);
-		return NULL;
+		skb = skb2;
+		if (!skb)
+			return NULL;
 	}
 
 	__skb_push(skb, SR_TX_OVERHEAD);

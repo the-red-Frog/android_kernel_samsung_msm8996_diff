@@ -42,13 +42,18 @@
 #include <linux/sched/sysctl.h>
 #include <linux/slab.h>
 #include <linux/compat.h>
-#include <linux/random.h>
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 #include <asm/div64.h>
 #include <asm/timex.h>
 #include <asm/io.h>
+
+#include "tick-internal.h"
+
+#ifdef CONFIG_SEC_DEBUG
+#include <linux/qcom/sec_debug.h>
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/timer.h>
@@ -94,6 +99,13 @@ struct tvec_base {
 struct tvec_base boot_tvec_bases;
 EXPORT_SYMBOL(boot_tvec_bases);
 static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;
+#ifdef CONFIG_SMP
+struct tvec_base tvec_base_deferrable;
+static atomic_t deferrable_pending;
+#endif
+
+static inline void __run_timers(struct tvec_base *base);
+static inline void __init_timers(struct tvec_base *base);
 
 /* Functions below help us manage 'deferrable' flag */
 static inline unsigned int tbase_get_deferrable(struct tvec_base *base)
@@ -400,6 +412,8 @@ __internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 
 static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 {
+	int leftmost = 0;
+
 	(void)catchup_timer_jiffies(base);
 	__internal_add_timer(base, timer);
 	/*
@@ -407,8 +421,10 @@ static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 	 */
 	if (!tbase_get_deferrable(timer->base)) {
 		if (!base->active_timers++ ||
-		    time_before(timer->expires, base->next_timer))
+		    time_before(timer->expires, base->next_timer)) {
 			base->next_timer = timer->expires;
+			leftmost = 1;
+		}
 	}
 	base->all_timers++;
 
@@ -425,7 +441,7 @@ static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 	 * require special care against races with idle_cpu(), lets deal
 	 * with that later.
 	 */
-	if (!tbase_get_deferrable(base) || tick_nohz_full_cpu(base->cpu))
+	if (leftmost || tick_nohz_full_cpu(base->cpu))
 		wake_up_nohz_cpu(base->cpu);
 }
 
@@ -653,10 +669,67 @@ static inline void debug_assert_init(struct timer_list *timer)
 	debug_timer_assert_init(timer);
 }
 
+#ifdef CONFIG_SMP
+static inline struct tvec_base *__get_timer_base(unsigned int flags)
+{
+	if (flags & TIMER_DEFERRABLE)
+		return &tvec_base_deferrable;
+	else
+		return raw_cpu_read(tvec_bases);
+}
+
+static inline bool is_deferrable_timer_base(struct tvec_base *base)
+{
+	return base == &tvec_base_deferrable;
+}
+
+static inline void __run_deferrable_timers(void)
+{
+	if (time_after_eq(jiffies, tvec_base_deferrable.timer_jiffies)) {
+		if ((atomic_cmpxchg(&deferrable_pending, 1, 0) &&
+			tick_do_timer_cpu == TICK_DO_TIMER_NONE) ||
+			tick_do_timer_cpu == smp_processor_id())
+				__run_timers(&tvec_base_deferrable);
+
+	}
+}
+
+static inline void init_deferrable_timer(void)
+{
+	spin_lock_init(&tvec_base_deferrable.lock);
+	tvec_base_deferrable.cpu = nr_cpu_ids;
+	__init_timers(&tvec_base_deferrable);
+}
+#else
+static inline struct tvec_base *__get_timer_base(unsigned int flags)
+{
+	return raw_cpu_read(tvec_bases);
+}
+
+static inline bool is_deferrable_timer_base(struct tvec_base *base)
+{
+	return false;
+}
+
+static inline void __run_deferrable_timers(void)
+{
+}
+
+static inline void init_deferrable_timer(void)
+{
+	/*
+	 * initialize cpu unbound deferrable timer base only when CONFIG_SMP.
+	 * UP kernel handles the timers with cpu 0 timer base.
+	 */
+}
+#endif
+
 static void do_init_timer(struct timer_list *timer, unsigned int flags,
 			  const char *name, struct lock_class_key *key)
 {
-	struct tvec_base *base = raw_cpu_read(tvec_bases);
+	struct tvec_base *base;
+
+	base = __get_timer_base(flags);
 
 	timer->entry.next = NULL;
 	timer->base = (void *)((unsigned long)base | flags);
@@ -778,24 +851,26 @@ __mod_timer(struct timer_list *timer, unsigned long expires,
 
 	debug_activate(timer, expires);
 
-	cpu = get_nohz_timer_target(pinned);
-	new_base = per_cpu(tvec_bases, cpu);
+	if (!is_deferrable_timer_base(base) || pinned == TIMER_PINNED) {
+		cpu = get_nohz_timer_target(pinned);
+		new_base = per_cpu(tvec_bases, cpu);
 
-	if (base != new_base) {
-		/*
-		 * We are trying to schedule the timer on the local CPU.
-		 * However we can't change timer's base while it is running,
-		 * otherwise del_timer_sync() can't detect that the timer's
-		 * handler yet has not finished. This also guarantees that
-		 * the timer is serialized wrt itself.
-		 */
-		if (likely(base->running_timer != timer)) {
-			/* See the comment in lock_timer_base() */
-			timer_set_base(timer, NULL);
-			spin_unlock(&base->lock);
-			base = new_base;
-			spin_lock(&base->lock);
-			timer_set_base(timer, base);
+		if (base != new_base) {
+			/*
+			 * We are trying to schedule the timer on the local CPU.
+			 * However we can't change timer's base while it is
+			 * running, otherwise del_timer_sync() can't detect that
+			 * the timer's handler yet has not finished. This also
+			 * guarantees that the timer is serialized wrt itself.
+			 */
+			if (likely(base->running_timer != timer)) {
+				/* See the comment in lock_timer_base() */
+				timer_set_base(timer, NULL);
+				spin_unlock(&base->lock);
+				base = new_base;
+				spin_lock(&base->lock);
+				timer_set_base(timer, base);
+			}
 		}
 	}
 
@@ -1153,7 +1228,13 @@ static void call_timer_fn(struct timer_list *timer, void (*fn)(unsigned long),
 	lock_map_acquire(&lockdep_map);
 
 	trace_timer_expire_entry(timer);
+#ifdef CONFIG_SEC_DEBUG
+	secdbg_msg("timer %pS entry", fn);
+#endif
 	fn(data);
+#ifdef CONFIG_SEC_DEBUG
+	secdbg_msg("timer %pS exit", fn);
+#endif
 	trace_timer_expire_exit(timer);
 
 	lock_map_release(&lockdep_map);
@@ -1354,6 +1435,30 @@ static unsigned long cmp_next_hrtimer_event(unsigned long now,
 	return expires;
 }
 
+#ifdef CONFIG_SMP
+/*
+ * check_pending_deferrable_timers - Check for unbound deferrable timer expiry.
+ * @cpu - Current CPU
+ *
+ * The function checks whether any global deferrable pending timers
+ * are exipired or not. This function does not check cpu bounded
+ * diferrable pending timers expiry.
+ *
+ * The function returns true when a cpu unbounded deferrable timer is expired.
+ */
+bool check_pending_deferrable_timers(int cpu)
+{
+	if (cpu == tick_do_timer_cpu ||
+		tick_do_timer_cpu == TICK_DO_TIMER_NONE) {
+		if (time_after_eq(jiffies, tvec_base_deferrable.timer_jiffies)
+			&& !atomic_cmpxchg(&deferrable_pending, 0, 1)) {
+				return true;
+		}
+	}
+	return false;
+}
+#endif
+
 /**
  * get_next_timer_interrupt - return the jiffy of the next pending timer
  * @now: current time (in jiffies)
@@ -1404,13 +1509,6 @@ void update_process_times(int user_tick)
 #endif
 	scheduler_tick();
 	run_posix_cpu_timers(p);
-
-	/* The current CPU might make use of net randoms without receiving IRQs
-	 * to renew them often enough. Let's update the net_rand_state from a
-	 * non-constant value that's not affine to the number of calls to make
-	 * sure it's updated when there's some activity (we don't care in idle).
-	 */
-	this_cpu_add(net_rand_state.s1, rol32(jiffies, 24) + user_tick);
 }
 
 /*
@@ -1421,6 +1519,8 @@ static void run_timer_softirq(struct softirq_action *h)
 	struct tvec_base *base = __this_cpu_read(tvec_bases);
 
 	hrtimer_run_pending();
+
+	__run_deferrable_timers();
 
 	if (time_after_eq(jiffies, base->timer_jiffies))
 		__run_timers(base);
@@ -1555,9 +1655,27 @@ signed long __sched schedule_timeout_uninterruptible(signed long timeout)
 }
 EXPORT_SYMBOL(schedule_timeout_uninterruptible);
 
-static int init_timers_cpu(int cpu)
+static inline void __init_timers(struct tvec_base *base)
 {
 	int j;
+
+	for (j = 0; j < TVN_SIZE; j++) {
+		INIT_LIST_HEAD(base->tv5.vec + j);
+		INIT_LIST_HEAD(base->tv4.vec + j);
+		INIT_LIST_HEAD(base->tv3.vec + j);
+		INIT_LIST_HEAD(base->tv2.vec + j);
+	}
+	for (j = 0; j < TVR_SIZE; j++)
+		INIT_LIST_HEAD(base->tv1.vec + j);
+
+	base->timer_jiffies = jiffies;
+	base->next_timer = base->timer_jiffies;
+	base->active_timers = 0;
+	base->all_timers = 0;
+}
+
+static int init_timers_cpu(int cpu)
+{
 	struct tvec_base *base;
 	static char tvec_base_done[NR_CPUS];
 
@@ -1596,20 +1714,8 @@ static int init_timers_cpu(int cpu)
 		base = per_cpu(tvec_bases, cpu);
 	}
 
+	__init_timers(base);
 
-	for (j = 0; j < TVN_SIZE; j++) {
-		INIT_LIST_HEAD(base->tv5.vec + j);
-		INIT_LIST_HEAD(base->tv4.vec + j);
-		INIT_LIST_HEAD(base->tv3.vec + j);
-		INIT_LIST_HEAD(base->tv2.vec + j);
-	}
-	for (j = 0; j < TVR_SIZE; j++)
-		INIT_LIST_HEAD(base->tv1.vec + j);
-
-	base->timer_jiffies = jiffies;
-	base->next_timer = base->timer_jiffies;
-	base->active_timers = 0;
-	base->all_timers = 0;
 	return 0;
 }
 
@@ -1700,6 +1806,8 @@ void __init init_timers(void)
 	err = timer_cpu_notify(&timers_nb, (unsigned long)CPU_UP_PREPARE,
 			       (void *)(long)smp_processor_id());
 	BUG_ON(err != NOTIFY_OK);
+
+	init_deferrable_timer();
 
 	init_timer_stats();
 	register_cpu_notifier(&timers_nb);

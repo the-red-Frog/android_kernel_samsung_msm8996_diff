@@ -132,7 +132,6 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_sb = sb;
 	inode->i_blkbits = sb->s_blocksize_bits;
 	inode->i_flags = 0;
-	atomic64_set(&inode->i_sequence, 0);
 	atomic_set(&inode->i_count, 1);
 	inode->i_op = &empty_iops;
 	inode->i_fop = &empty_fops;
@@ -154,12 +153,6 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_rdev = 0;
 	inode->dirtied_when = 0;
 
-#ifdef CONFIG_CGROUP_WRITEBACK
-	inode->i_wb_frn_winner = 0;
-	inode->i_wb_frn_avg_time = 0;
-	inode->i_wb_frn_history = 0;
-#endif
-
 	if (security_inode_alloc(inode))
 		goto out;
 	spin_lock_init(&inode->i_lock);
@@ -174,10 +167,22 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	mapping->host = inode;
 	mapping->flags = 0;
 	atomic_set(&mapping->i_mmap_writable, 0);
+#ifdef CONFIG_RBIN
+	if ((sb->s_flags & MS_RDONLY) && !shmem_mapping(mapping))
+		mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE |
+					__GFP_RBIN);
+	else
+		mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE);
+#else
 	mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE);
+#endif
 	mapping->private_data = NULL;
 	mapping->backing_dev_info = &default_backing_dev_info;
 	mapping->writeback_index = 0;
+
+#ifdef CONFIG_SDP
+	mapping->userid = 0;
+#endif
 
 	/*
 	 * If the block_device provides a backing_dev_info for client
@@ -630,7 +635,6 @@ void evict_inodes(struct super_block *sb)
 
 	dispose_list(&dispose);
 }
-EXPORT_SYMBOL_GPL(evict_inodes);
 
 /**
  * invalidate_inodes	- attempt to free all inodes on a superblock
@@ -1650,13 +1654,8 @@ int file_remove_suid(struct file *file)
 	int killpriv;
 	int error = 0;
 
-	/*
-	 * Fast path for nothing security related.
-	 * As well for non-regular files, e.g. blkdev inodes.
-	 * For example, blkdev_write_iter() might get here
-	 * trying to remove privs which it is not allowed to.
-	 */
-	if (IS_NOSEC(inode) || !S_ISREG(inode->i_mode))
+	/* Fast path for nothing security related */
+	if (IS_NOSEC(inode))
 		return 0;
 
 	killsuid = should_remove_suid(dentry);
@@ -1976,27 +1975,3 @@ void inode_nohighmem(struct inode *inode)
 	mapping_set_gfp_mask(inode->i_mapping, GFP_USER);
 }
 EXPORT_SYMBOL(inode_nohighmem);
-
-/*
- * Generic function to check FS_IOC_SETFLAGS values and reject any invalid
- * configurations.
- *
- * Note: the caller should be holding i_mutex, or else be sure that they have
- * exclusive access to the inode structure.
- */
-int vfs_ioc_setflags_prepare(struct inode *inode, unsigned int oldflags,
-			     unsigned int flags)
-{
-	/*
-	 * The IMMUTABLE and APPEND_ONLY flags can only be changed by
-	 * the relevant capability.
-	 *
-	 * This test looks nicer. Thanks to Pauline Middelink
-	 */
-	if ((flags ^ oldflags) & (FS_APPEND_FL | FS_IMMUTABLE_FL) &&
-	    !capable(CAP_LINUX_IMMUTABLE))
-		return -EPERM;
-
-	return 0;
-}
-EXPORT_SYMBOL(vfs_ioc_setflags_prepare);

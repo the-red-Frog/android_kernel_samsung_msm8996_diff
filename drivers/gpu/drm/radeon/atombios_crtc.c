@@ -275,8 +275,6 @@ void atombios_crtc_dpms(struct drm_crtc *crtc, int mode)
 			atombios_enable_crtc_memreq(crtc, ATOM_ENABLE);
 		atombios_blank_crtc(crtc, ATOM_DISABLE);
 		drm_vblank_post_modeset(dev, radeon_crtc->crtc_id);
-		/* Make sure vblank interrupt is still enabled if needed */
-		radeon_irq_set(rdev);
 		radeon_crtc_load_lut(crtc);
 		break;
 	case DRM_MODE_DPMS_STANDBY:
@@ -611,6 +609,13 @@ static u32 atombios_adjust_pll(struct drm_crtc *crtc,
 
 			dp_clock = dig_connector->dp_clock;
 		}
+	}
+
+	if (radeon_encoder->is_mst_encoder) {
+		struct radeon_encoder_mst *mst_enc = radeon_encoder->enc_priv;
+		struct radeon_connector_atom_dig *dig_connector = mst_enc->connector->con_priv;
+
+		dp_clock = dig_connector->dp_clock;
 	}
 
 	/* use recommended ref_div for ss */
@@ -961,7 +966,9 @@ static bool atombios_crtc_prepare_pll(struct drm_crtc *crtc, struct drm_display_
 	radeon_crtc->bpc = 8;
 	radeon_crtc->ss_enabled = false;
 
-	if ((radeon_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT | ATOM_DEVICE_DFP_SUPPORT)) ||
+	if (radeon_encoder->is_mst_encoder) {
+		radeon_dp_mst_prepare_pll(crtc, mode);
+	} else if ((radeon_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT | ATOM_DEVICE_DFP_SUPPORT)) ||
 	    (radeon_encoder_get_dp_bridge_encoder_id(radeon_crtc->encoder) != ENCODER_OBJECT_ID_NONE)) {
 		struct radeon_encoder_atom_dig *dig = radeon_encoder->enc_priv;
 		struct drm_connector *connector =
@@ -2060,6 +2067,7 @@ int atombios_crtc_mode_set(struct drm_crtc *crtc,
 	atombios_crtc_set_base(crtc, x, y, old_fb);
 	atombios_overscan_setup(crtc, mode, adjusted_mode);
 	atombios_scaler_setup(crtc);
+	radeon_cursor_reset(crtc);
 	/* update the hw version fpr dpm */
 	radeon_crtc->hw_mode = *adjusted_mode;
 
@@ -2086,6 +2094,12 @@ static bool atombios_crtc_mode_fixup(struct drm_crtc *crtc,
 		radeon_crtc->encoder = NULL;
 		radeon_crtc->connector = NULL;
 		return false;
+	}
+	if (radeon_crtc->encoder) {
+		struct radeon_encoder *radeon_encoder =
+			to_radeon_encoder(radeon_crtc->encoder);
+
+		radeon_crtc->output_csc = radeon_encoder->output_csc;
 	}
 	if (!radeon_crtc_scaling_mode_fixup(crtc, mode, adjusted_mode))
 		return false;

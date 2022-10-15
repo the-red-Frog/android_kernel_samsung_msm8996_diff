@@ -91,29 +91,6 @@ static inline void get_page_foll(struct page *page)
 	}
 }
 
-static inline __must_check bool try_get_page_foll(struct page *page)
-{
-	if (unlikely(PageTail(page))) {
-		if (WARN_ON_ONCE(atomic_read(&compound_head(page)->_count) <= 0))
-			return false;
-		/*
-		 * This is safe only because
-		 * __split_huge_page_refcount() can't run under
-		 * get_page_foll() because we hold the proper PT lock.
-		 */
-		__get_page_tail_foll(page, true);
-	} else {
-		/*
-		 * Getting a normal page or the head of a compound page
-		 * requires to already have an elevated page->_count.
-		 */
-		if (WARN_ON_ONCE(atomic_read(&page->_count) <= 0))
-			return false;
-		atomic_inc(&page->_count);
-	}
-	return true;
-}
-
 extern unsigned long highest_memmap_pfn;
 
 /*
@@ -192,6 +169,8 @@ struct compact_control {
 
 	int order;			/* order a direct compactor needs */
 	const gfp_t gfp_mask;		/* gfp mask of a direct compactor */
+	const int alloc_flags;		/* alloc flags of a direct compactor */
+	const int classzone_idx;	/* zone index of a direct compactor */
 	struct zone *zone;
 	int contended;			/* Signal need_sched() or lock
 					 * contention detected during
@@ -291,10 +270,8 @@ static inline void mlock_migrate_page(struct page *newpage, struct page *page)
 
 extern pmd_t maybe_pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma);
 
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 extern unsigned long vma_address(struct page *page,
 				 struct vm_area_struct *vma);
-#endif
 #else /* !CONFIG_MMU */
 static inline void clear_page_mlock(struct page *page) { }
 static inline void mlock_vma_page(struct page *page) { }
@@ -433,5 +410,8 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
 #define ALLOC_CPUSET		0x40 /* check for correct cpuset */
 #define ALLOC_CMA		0x80 /* allow allocations from CMA areas */
 #define ALLOC_FAIR		0x100 /* fair zone allocation */
+#define ALLOC_RBIN		0x200 /* allow allocations from RBIN areas */
+
+extern void test_and_set_mem_boost_timeout(void);
 
 #endif	/* __MM_INTERNAL_H */

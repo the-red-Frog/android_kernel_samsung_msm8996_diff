@@ -353,7 +353,7 @@ EXPORT_SYMBOL(blk_put_queue);
  * If not, only ELVPRIV requests are drained.  The caller is responsible
  * for ensuring that no new requests which need to be drained are queued.
  */
-static void __blk_drain_queue(struct request_queue *q, bool drain_all)
+void __blk_drain_queue(struct request_queue *q, bool drain_all)
 	__releases(q->queue_lock)
 	__acquires(q->queue_lock)
 {
@@ -611,9 +611,6 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 
 	kobject_init(&q->kobj, &blk_queue_ktype);
 
-#ifdef CONFIG_BLK_DEV_IO_TRACE
-	mutex_init(&q->blk_trace_mutex);
-#endif
 	mutex_init(&q->sysfs_lock);
 	spin_lock_init(&q->__queue_lock);
 
@@ -1164,8 +1161,6 @@ static struct request *blk_old_get_request(struct request_queue *q, int rw,
 {
 	struct request *rq;
 
-	BUG_ON(rw != READ && rw != WRITE);
-
 	/* create ioc upfront */
 	create_io_context(gfp_mask, q->node);
 
@@ -1337,8 +1332,10 @@ EXPORT_SYMBOL_GPL(part_round_stats);
 #ifdef CONFIG_PM_RUNTIME
 static void blk_pm_put_request(struct request *rq)
 {
-	if (rq->q->dev && !(rq->cmd_flags & REQ_PM) && !--rq->q->nr_pending)
-		pm_runtime_mark_last_busy(rq->q->dev);
+	if (rq->q->dev && !(rq->cmd_flags & REQ_PM) && rq->q->nr_pending) {
+		if (!--rq->q->nr_pending)
+			pm_runtime_mark_last_busy(rq->q->dev);
+	}
 }
 #else
 static inline void blk_pm_put_request(struct request *rq) {}
@@ -1361,8 +1358,8 @@ void __blk_put_request(struct request_queue *q, struct request *req)
 
 	elv_completed_request(q, req);
 
-	/* this is a bio leak */
-	WARN_ON(req->bio != NULL);
+	/* this is a bio leak if the bio is not tagged with BIO_DONTFREE */
+	WARN_ON(req->bio && !bio_flagged(req->bio, BIO_DONTFREE));
 
 	/*
 	 * Request may not have originated from ll_rw_blk. if not,
@@ -1544,11 +1541,17 @@ void init_request_from_bio(struct request *req, struct bio *bio)
 	if (bio->bi_rw & REQ_RAHEAD)
 		req->cmd_flags |= REQ_FAILFAST_MASK;
 
+#ifdef CONFIG_JOURNAL_DATA_TAG
+       if (bio_flagged(bio, BIO_JMETA) || bio_flagged(bio, BIO_JOURNAL))
+               req->cmd_flags |= REQ_META;
+#endif
+
 	req->errors = 0;
 	req->__sector = bio->bi_iter.bi_sector;
 	req->ioprio = bio_prio(bio);
 	blk_rq_bio_prep(req->q, req, bio);
 }
+EXPORT_SYMBOL(init_request_from_bio);
 
 void blk_queue_bio(struct request_queue *q, struct bio *bio)
 {
@@ -1570,7 +1573,8 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
 		return;
 	}
 
-	if (bio->bi_rw & (REQ_FLUSH | REQ_FUA)) {
+	if (bio->bi_rw & (REQ_FLUSH | REQ_FUA | REQ_POST_FLUSH_BARRIER |
+			  REQ_BARRIER)) {
 		spin_lock_irq(q->queue_lock);
 		where = ELEVATOR_INSERT_FLUSH;
 		goto get_rq;
@@ -1923,6 +1927,27 @@ void generic_make_request(struct bio *bio)
 }
 EXPORT_SYMBOL(generic_make_request);
 
+#ifdef CONFIG_BLK_DEV_IO_TRACE
+static inline struct task_struct *get_dirty_task(struct bio *bio)
+{
+	/*
+	 * Not all the pages in the bio are dirtied by the
+	 * same task but most likely it will be, since the
+	 * sectors accessed on the device must be adjacent.
+	 */
+	if (bio->bi_io_vec && bio->bi_io_vec->bv_page &&
+		bio->bi_io_vec->bv_page->tsk_dirty)
+			return bio->bi_io_vec->bv_page->tsk_dirty;
+	else
+		return current;
+}
+#else
+static inline struct task_struct *get_dirty_task(struct bio *bio)
+{
+	return current;
+}
+#endif
+
 /**
  * submit_bio - submit a bio to the block device layer for I/O
  * @rw: whether to %READ or %WRITE, or maybe to %READA (read ahead)
@@ -1958,8 +1983,11 @@ void submit_bio(int rw, struct bio *bio)
 
 		if (unlikely(block_dump)) {
 			char b[BDEVNAME_SIZE];
+			struct task_struct *tsk;
+
+			tsk = get_dirty_task(bio);
 			printk(KERN_DEBUG "%s(%d): %s block %Lu on %s (%u sectors)\n",
-			current->comm, task_pid_nr(current),
+				tsk->comm, task_pid_nr(tsk),
 				(rw & WRITE) ? "WRITE" : "READ",
 				(unsigned long long)bio->bi_iter.bi_sector,
 				bdevname(bio->bi_bdev, b),
@@ -2113,6 +2141,8 @@ void blk_account_io_completion(struct request *req, unsigned int bytes)
 		cpu = part_stat_lock();
 		part = req->part;
 		part_stat_add(cpu, part, sectors[rw], bytes >> 9);
+		if (req->cmd_flags & REQ_DISCARD)
+			part_stat_add(cpu, part, discard_sectors, bytes >> 9);
 		part_stat_unlock();
 	}
 }
@@ -2137,10 +2167,17 @@ void blk_account_io_done(struct request *req)
 		part_stat_add(cpu, part, ticks[rw], duration);
 		part_round_stats(cpu, part);
 		part_dec_in_flight(part, rw);
+		if (req->cmd_flags & REQ_DISCARD)
+			part_stat_inc(cpu, part, discard_ios);
+		if (!(req->cmd_flags & REQ_STARTED))
+			part_stat_inc(cpu, part, flush_ios);
 
 		hd_struct_put(part);
 		part_stat_unlock();
 	}
+
+	if (req->cmd_flags & REQ_FLUSH_SEQ)
+		req->q->flush_ios++;
 }
 
 #ifdef CONFIG_PM_RUNTIME
@@ -2321,6 +2358,8 @@ void blk_dequeue_request(struct request *rq)
 	 * the driver side.
 	 */
 	if (blk_account_rq(rq)) {
+		if (!queue_in_flight(q))
+			q->in_flight_stamp = ktime_get();
 		q->in_flight[rq_is_sync(rq)]++;
 		set_io_start_time_ns(rq);
 	}
@@ -2463,6 +2502,15 @@ bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
 	blk_account_io_completion(req, nr_bytes);
 
 	total_bytes = 0;
+
+	/*
+	 * Check for this if flagged, Req based dm needs to perform
+	 * post processing, hence dont end bios or request.DM
+	 * layer takes care.
+	 */
+	if (bio_flagged(req->bio, BIO_DONTFREE))
+		return false;
+
 	while (req->bio) {
 		struct bio *bio = req->bio;
 		unsigned bio_bytes = min(bio->bi_iter.bi_size, nr_bytes);
@@ -2935,7 +2983,7 @@ int blk_rq_prep_clone(struct request *rq, struct request *rq_src,
 	blk_rq_init(NULL, rq);
 
 	__rq_for_each_bio(bio_src, rq_src) {
-		bio = bio_clone_fast(bio_src, gfp_mask, bs);
+		bio = bio_clone_bioset(bio_src, gfp_mask, bs);
 		if (!bio)
 			goto free_and_out;
 
@@ -3311,6 +3359,72 @@ void blk_post_runtime_resume(struct request_queue *q, int err)
 EXPORT_SYMBOL(blk_post_runtime_resume);
 #endif
 
+#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+/*********************************
+ * debugfs functions
+ **********************************/
+#ifdef CONFIG_DEBUG_FS
+#include <linux/debugfs.h>
+
+#define DBGFS_FUNC_DECL(name) \
+static int sio_open_##name(struct inode *inode, struct file *file) \
+{ \
+	return single_open(file, sio_show_##name, inode->i_private); \
+} \
+static const struct file_operations sio_fops_##name = { \
+	.owner		= THIS_MODULE, \
+	.open		= sio_open_##name, \
+	.llseek		= seq_lseek, \
+	.read		= seq_read, \
+	.release	= single_release, \
+}
+
+static int sio_show_patches(struct seq_file *s, void *p)
+{
+	extern char *__start_sio_patches;
+	extern char *__stop_sio_patches;
+	char **p_version_str;
+
+	for (p_version_str = &__start_sio_patches; p_version_str < &__stop_sio_patches; ++p_version_str)
+		seq_printf(s, "%s\n", *p_version_str);
+
+	return 0;
+}
+
+static struct dentry *sio_debugfs_root;
+
+DBGFS_FUNC_DECL(patches);
+
+SIO_PATCH_VERSION(SIO_patch_manager, 1, 0, "");
+
+static int __init sio_debugfs_init(void)
+{
+	if (!debugfs_initialized())
+		return -ENODEV;
+
+	sio_debugfs_root = debugfs_create_dir("sio", NULL);
+	if (!sio_debugfs_root)
+		return -ENOMEM;
+
+	debugfs_create_file("patches", 0400, sio_debugfs_root, NULL, &sio_fops_patches);
+
+	return 0;
+}
+
+static void __exit sio_debugfs_exit(void)
+{
+	debugfs_remove_recursive(sio_debugfs_root);
+}
+#else
+static int __init sio_debugfs_init(void)
+{
+	return 0;
+}
+
+static void __exit sio_debugfs_exit(void) { }
+#endif
+#endif
+
 int __init blk_dev_init(void)
 {
 	BUILD_BUG_ON(__REQ_NR_BITS > 8 *
@@ -3327,6 +3441,10 @@ int __init blk_dev_init(void)
 
 	blk_requestq_cachep = kmem_cache_create("blkdev_queue",
 			sizeof(struct request_queue), 0, SLAB_PANIC, NULL);
+
+#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+	   sio_debugfs_init();
+#endif
 
 	return 0;
 }

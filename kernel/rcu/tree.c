@@ -1399,23 +1399,15 @@ static int rcu_future_gp_cleanup(struct rcu_state *rsp, struct rcu_node *rnp)
 }
 
 /*
- * Awaken the grace-period kthread.  Don't do a self-awaken (unless in
- * an interrupt or softirq handler), and don't bother awakening when there
- * is nothing for the grace-period kthread to do (as in several CPUs raced
- * to awaken, and we lost), and finally don't try to awaken a kthread that
- * has not yet been created.  If all those checks are passed, track some
- * debug information and awaken.
- *
- * So why do the self-wakeup when in an interrupt or softirq handler
- * in the grace-period kthread's context?  Because the kthread might have
- * been interrupted just as it was going to sleep, and just after the final
- * pre-sleep check of the awaken condition.  In this case, a wakeup really
- * is required, and is therefore supplied.
+ * Awaken the grace-period kthread for the specified flavor of RCU.
+ * Don't do a self-awaken, and don't bother awakening when there is
+ * nothing for the grace-period kthread to do (as in several CPUs
+ * raced to awaken, and we lost), and finally don't try to awaken
+ * a kthread that has not yet been created.
  */
 static void rcu_gp_kthread_wake(struct rcu_state *rsp)
 {
-	if ((current == rsp->gp_kthread &&
-	     !in_interrupt() && !in_serving_softirq()) ||
+	if (current == rsp->gp_kthread ||
 	    !ACCESS_ONCE(rsp->gp_flags) ||
 	    !rsp->gp_kthread)
 		return;
@@ -3162,30 +3154,19 @@ static int rcu_pending(int cpu)
 }
 
 /*
- * Return true if the specified CPU has any callback.  If all_lazy is
- * non-NULL, store an indication of whether all callbacks are lazy.
- * (If there are no callbacks, all of them are deemed to be lazy.)
+ * Check to see if any future RCU-related work will need to be done
+ * by the current CPU, even if none need be done immediately, returning
+ * 1 if so.
  */
-static int __maybe_unused rcu_cpu_has_callbacks(int cpu, bool *all_lazy)
+static int __maybe_unused rcu_cpu_has_callbacks(int cpu)
 {
-	bool al = true;
-	bool hc = false;
-	struct rcu_data *rdp;
 	struct rcu_state *rsp;
 
-	for_each_rcu_flavor(rsp) {
-		rdp = per_cpu_ptr(rsp->rda, cpu);
-		if (!rdp->nxtlist)
-			continue;
-		hc = true;
-		if (rdp->qlen != rdp->qlen_lazy || !all_lazy) {
-			al = false;
-			break;
-		}
-	}
-	if (all_lazy)
-		*all_lazy = al;
-	return hc;
+	/* RCU callbacks either ready or pending? */
+	for_each_rcu_flavor(rsp)
+		if (per_cpu_ptr(rsp->rda, cpu)->nxtlist)
+			return 1;
+	return 0;
 }
 
 /*
@@ -3420,6 +3401,7 @@ rcu_init_percpu_data(int cpu, struct rcu_state *rsp)
 	rcu_sysidle_init_percpu_data(rdp->dynticks);
 	atomic_set(&rdp->dynticks->dynticks,
 		   (atomic_read(&rdp->dynticks->dynticks) & ~0x1) + 1);
+	rcu_prepare_for_idle_init(cpu);
 	raw_spin_unlock(&rnp->lock);		/* irqs remain disabled. */
 
 	/* Add CPU to rcu_node bitmasks. */
@@ -3488,13 +3470,16 @@ static int rcu_cpu_notify(struct notifier_block *self,
 	case CPU_DYING_FROZEN:
 		for_each_rcu_flavor(rsp)
 			rcu_cleanup_dying_cpu(rsp);
+		rcu_cleanup_after_idle(cpu);
 		break;
 	case CPU_DEAD:
 	case CPU_DEAD_FROZEN:
 	case CPU_UP_CANCELED:
 	case CPU_UP_CANCELED_FROZEN:
-		for_each_rcu_flavor(rsp)
+		for_each_rcu_flavor(rsp) {
 			rcu_cleanup_dead_cpu(cpu, rsp);
+			do_nocb_deferred_wakeup(per_cpu_ptr(rsp->rda, cpu));
+		}
 		break;
 	default:
 		break;

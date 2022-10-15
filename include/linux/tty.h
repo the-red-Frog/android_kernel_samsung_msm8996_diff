@@ -41,7 +41,7 @@ struct tty_buffer {
 	int read;
 	int flags;
 	/* Data points here */
-	unsigned long data[];
+	unsigned long data[0];
 };
 
 /* Values for .flags field of tty_buffer */
@@ -258,10 +258,6 @@ struct tty_struct {
 	struct termiox *termiox;	/* May be NULL for unsupported */
 	char name[64];
 	struct pid *pgrp;		/* Protected by ctrl lock */
-	/*
-	 * Writes protected by both ctrl lock and legacy mutex, readers must use
-	 * at least one of them.
-	 */
 	struct pid *session;
 	unsigned long flags;
 	int count;
@@ -356,7 +352,6 @@ extern void proc_clear_tty(struct task_struct *p);
 extern struct tty_struct *get_current_tty(void);
 /* tty_io.c */
 extern int __init tty_init(void);
-extern char *tty_name(struct tty_struct *tty, char *buf);
 #else
 static inline void console_init(void)
 { }
@@ -377,8 +372,6 @@ static inline struct tty_struct *get_current_tty(void)
 /* tty_io.c */
 static inline int __init tty_init(void)
 { return 0; }
-static inline char *tty_name(struct tty_struct *tty, char *buf)
-{ return "(none)"; }
 #endif
 
 extern void tty_write_flush(struct tty_struct *);
@@ -407,6 +400,7 @@ static inline struct tty_struct *tty_kref_get(struct tty_struct *tty)
 
 extern int tty_paranoia_check(struct tty_struct *tty, struct inode *inode,
 			      const char *routine);
+extern char *tty_name(struct tty_struct *tty, char *buf);
 extern void tty_wait_until_sent(struct tty_struct *tty, long timeout);
 extern int tty_check_change(struct tty_struct *tty);
 extern void __stop_tty(struct tty_struct *tty);
@@ -569,7 +563,7 @@ extern int tty_unregister_ldisc(int disc);
 extern int tty_set_ldisc(struct tty_struct *tty, int ldisc);
 extern int tty_ldisc_setup(struct tty_struct *tty, struct tty_struct *o_tty);
 extern void tty_ldisc_release(struct tty_struct *tty, struct tty_struct *o_tty);
-extern int __must_check tty_ldisc_init(struct tty_struct *tty);
+extern void tty_ldisc_init(struct tty_struct *tty);
 extern void tty_ldisc_deinit(struct tty_struct *tty);
 extern void tty_ldisc_begin(void);
 
@@ -648,7 +642,6 @@ extern long vt_compat_ioctl(struct tty_struct *tty,
 /* tty_mutex.c */
 /* functions for preparation of BKL removal */
 extern void __lockfunc tty_lock(struct tty_struct *tty);
-extern int  tty_lock_interruptible(struct tty_struct *tty);
 extern void __lockfunc tty_unlock(struct tty_struct *tty);
 extern void __lockfunc tty_lock_pair(struct tty_struct *tty,
 				struct tty_struct *tty2);

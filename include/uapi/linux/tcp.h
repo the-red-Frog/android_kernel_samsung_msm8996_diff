@@ -112,6 +112,9 @@ enum {
 #define TCP_FASTOPEN		23	/* Enable FastOpen on listeners */
 #define TCP_TIMESTAMP		24
 #define TCP_NOTSENT_LOWAT	25	/* limit number of unsent bytes in write queue */
+#ifdef CONFIG_MPTCP
+#define MPTCP_ENABLED		26
+#endif
 
 struct tcp_repair_opt {
 	__u32	opt_code;
@@ -154,6 +157,7 @@ struct tcp_info {
 	__u8	tcpi_backoff;
 	__u8	tcpi_options;
 	__u8	tcpi_snd_wscale : 4, tcpi_rcv_wscale : 4;
+	__u8	tcpi_count;
 
 	__u32	tcpi_rto;
 	__u32	tcpi_ato;
@@ -189,6 +193,10 @@ struct tcp_info {
 
 	__u64	tcpi_pacing_rate;
 	__u64	tcpi_max_pacing_rate;
+	__u64	tcpi_bytes_acked;    /* RFC4898 tcpEStatsAppHCThruOctetsAcked */
+	__u64	tcpi_bytes_received; /* RFC4898 tcpEStatsAppHCThruOctetsReceived */
+	__u32	tcpi_segs_out;	     /* RFC4898 tcpEStatsPerfSegsOut */
+	__u32	tcpi_segs_in;	     /* RFC4898 tcpEStatsPerfSegsIn */
 };
 
 /* for TCP_MD5SIG socket option */

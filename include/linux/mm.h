@@ -26,6 +26,7 @@ struct anon_vma_chain;
 struct file_ra_state;
 struct user_struct;
 struct writeback_control;
+struct super_block;
 
 #ifndef CONFIG_NEED_MULTIPLE_NODES	/* Don't use mapnrs, do it properly */
 extern unsigned long max_mapnr;
@@ -49,8 +50,8 @@ extern int sysctl_legacy_va_layout;
 #endif
 
 #ifdef CONFIG_HAVE_ARCH_MMAP_RND_BITS
-extern const int mmap_rnd_bits_min;
-extern const int mmap_rnd_bits_max;
+extern int mmap_rnd_bits_min;
+extern int mmap_rnd_bits_max;
 extern int mmap_rnd_bits __read_mostly;
 #endif
 #ifdef CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS
@@ -103,6 +104,12 @@ extern struct rb_root nommu_region_tree;
 extern struct rw_semaphore nommu_region_sem;
 
 extern unsigned int kobjsize(const void *objp);
+#endif
+
+#ifdef CONFIG_ZSWAP
+extern int sysctl_zswap_compact;
+extern int sysctl_zswap_compaction_handler(struct ctl_table *table, int write,
+			void __user *buffer, size_t *length, loff_t *ppos);
 #endif
 
 /*
@@ -192,6 +199,11 @@ extern unsigned int kobjsize(const void *objp);
 /* This mask defines which mm->def_flags a process can inherit its parent */
 #define VM_INIT_DEF_MASK	VM_NOHUGEPAGE
 
+#ifdef CONFIG_ARCH_MSM8953_SOC_SETTINGS
+#define MSM8953_TLMM_START_ADDR	0x01000000
+#define MSM8953_TLMM_END_ADDR	(0x01300000 - 1)
+#endif
+
 /*
  * mapping from the currently active vm_flags protection bits (the
  * low four bits) to a page protection mask..
@@ -212,15 +224,11 @@ extern pgprot_t protection_map[16];
  * ->fault function. The vma's ->fault is responsible for returning a bitmask
  * of VM_FAULT_xxx flags that give details about how the fault was handled.
  *
- * MM layer fills up gfp_mask for page allocations but fault handler might
- * alter it if its implementation requires a different allocation context.
- *
  * pgoff should be used in favour of virtual_address, if possible. If pgoff
  * is used, one may implement ->remap_pages to get nonlinear mapping support.
  */
 struct vm_fault {
 	unsigned int flags;		/* FAULT_FLAG_xxx flags */
-	gfp_t gfp_mask;			/* gfp mask to be used for allocations */
 	pgoff_t pgoff;			/* Logical page offset based on vma */
 	void __user *virtual_address;	/* Faulting virtual address */
 
@@ -238,7 +246,7 @@ struct vm_fault {
 /*
  * These are the virtual MM functions - opening of an area, closing and
  * unmapping it (needed to keep files on disk up-to-date etc), pointer
- * to the functions called when a no-page or a wp-page exception occurs. 
+ * to the functions called when a no-page or a wp-page exception occurs.
  */
 struct vm_operations_struct {
 	void (*open)(struct vm_area_struct * area);
@@ -374,16 +382,16 @@ unsigned long vmalloc_to_pfn(const void *addr);
  * On nommu, vmalloc/vfree wrap through kmalloc/kfree directly, so there
  * is no special casing required.
  */
+
+#ifdef CONFIG_MMU
+extern int is_vmalloc_addr(const void *x);
+#else
 static inline int is_vmalloc_addr(const void *x)
 {
-#ifdef CONFIG_MMU
-	unsigned long addr = (unsigned long)x;
-
-	return addr >= VMALLOC_START && addr < VMALLOC_END;
-#else
 	return 0;
-#endif
 }
+#endif
+
 #ifdef CONFIG_MMU
 extern int is_vmalloc_or_module_addr(const void *x);
 #else
@@ -525,18 +533,6 @@ static inline void get_page(struct page *page)
 	 */
 	VM_BUG_ON_PAGE(atomic_read(&page->_count) <= 0, page);
 	atomic_inc(&page->_count);
-}
-
-static inline __must_check bool try_get_page(struct page *page)
-{
-	if (unlikely(PageTail(page)))
-		if (likely(__get_page_tail(page)))
-			return true;
-
-	if (WARN_ON_ONCE(atomic_read(&page->_count) <= 0))
-		return false;
-	atomic_inc(&page->_count);
-	return true;
 }
 
 static inline struct page *virt_to_head_page(const void *x)
@@ -1141,8 +1137,6 @@ struct zap_details {
 
 struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
 		pte_t pte);
-struct page *vm_normal_page_pmd(struct vm_area_struct *vma, unsigned long addr,
-				pmd_t pmd);
 
 int zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
 		unsigned long size);
@@ -1732,7 +1726,6 @@ extern int __meminit init_per_zone_wmark_min(void);
 extern void mem_init(void);
 extern void __init mmap_init(void);
 extern void show_mem(unsigned int flags);
-extern long si_mem_available(void);
 extern void si_meminfo(struct sysinfo * val);
 extern void si_meminfo_node(struct sysinfo *val, int nid);
 
@@ -1747,6 +1740,13 @@ extern void zone_pcp_reset(struct zone *zone);
 
 /* page_alloc.c */
 extern int min_free_kbytes;
+
+/* vmscan.c */
+extern void reclaim_contig_migrate_range(unsigned long start,
+					 unsigned long end, bool drain);
+/* ion_rbin_heap.c */
+void wake_ion_rbin_heap_prereclaim(void);
+void wake_ion_rbin_heap_shrink(void);
 
 /* nommu.c */
 extern atomic_long_t mmap_pages_allocated;
@@ -1830,7 +1830,6 @@ extern void mm_drop_all_locks(struct mm_struct *mm);
 
 extern void set_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file);
 extern struct file *get_mm_exe_file(struct mm_struct *mm);
-extern struct file *get_task_exe_file(struct task_struct *task);
 
 extern int may_expand_vm(struct mm_struct *mm, unsigned long npages);
 extern struct vm_area_struct *_install_special_mapping(struct mm_struct *mm,
@@ -1903,7 +1902,10 @@ vm_unmapped_area(struct vm_unmapped_area_info *info)
 
 /* truncate.c */
 extern void truncate_inode_pages(struct address_space *, loff_t);
+extern void truncate_inode_pages_fill_zero(struct address_space *, loff_t);
 extern void truncate_inode_pages_range(struct address_space *,
+				       loff_t lstart, loff_t lend);
+extern void truncate_inode_pages_range_fill_zero(struct address_space *,
 				       loff_t lstart, loff_t lend);
 extern void truncate_inode_pages_final(struct address_space *);
 
@@ -1917,7 +1919,7 @@ int write_one_page(struct page *page, int wait);
 void task_dirty_inc(struct task_struct *tsk);
 
 /* readahead.c */
-#define VM_MAX_READAHEAD	128	/* kbytes */
+#define VM_MAX_READAHEAD	256	/* kbytes */
 #define VM_MIN_READAHEAD	16	/* kbytes (includes current page) */
 
 int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
@@ -1939,6 +1941,7 @@ void page_cache_async_readahead(struct address_space *mapping,
 unsigned long max_sane_readahead(unsigned long nr);
 
 extern unsigned long stack_guard_gap;
+
 /* Generic expand stack which grows the stack according to GROWS{UP,DOWN} */
 extern int expand_stack(struct vm_area_struct *vma, unsigned long address);
 
@@ -2033,8 +2036,6 @@ int remap_pfn_range(struct vm_area_struct *, unsigned long addr,
 int vm_insert_page(struct vm_area_struct *, unsigned long addr, struct page *);
 int vm_insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 			unsigned long pfn);
-int vm_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr,
-			unsigned long pfn, pgprot_t pgprot);
 int vm_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
 			unsigned long pfn);
 int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long len);
@@ -2065,6 +2066,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
 #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
 #define FOLL_TRIED	0x800	/* a retry, previous pass started an IO */
 #define FOLL_COW	0x4000	/* internal GUP flag */
+#define FOLL_CMA	0x80000	/* migrate if the page is from cma pageblock */
 
 typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
 			void *data);
@@ -2116,6 +2118,8 @@ int drop_caches_sysctl_handler(struct ctl_table *, int,
 					void __user *, size_t *, loff_t *);
 #endif
 
+
+void drop_pagecache_sb(struct super_block *sb, void *unused);
 unsigned long shrink_slab(struct shrink_control *shrink,
 			  unsigned long nr_pages_scanned,
 			  unsigned long lru_pages);
@@ -2198,6 +2202,20 @@ static inline bool page_is_guard(struct page *page) { return false; }
 void __init setup_nr_node_ids(void);
 #else
 static inline void setup_nr_node_ids(void) {}
+#endif
+
+#ifdef CONFIG_PROCESS_RECLAIM
+struct reclaim_param {
+	struct vm_area_struct *vma;
+	/* Number of pages scanned */
+	int nr_scanned;
+	/* max pages to reclaim */
+	int nr_to_reclaim;
+	/* pages reclaimed */
+	int nr_reclaimed;
+};
+extern struct reclaim_param reclaim_task_anon(struct task_struct *task,
+		int nr_to_reclaim);
 #endif
 
 #endif /* __KERNEL__ */

@@ -15,8 +15,6 @@
 #include <net/net_namespace.h>
 #include <linux/sched/rt.h>
 
-#include <asm/thread_info.h>
-
 #ifdef CONFIG_SMP
 # define INIT_PUSHABLE_TASKS(tsk)					\
 	.pushable_tasks = PLIST_NODE_INIT(tsk.pushable_tasks, MAX_PRIO),
@@ -168,10 +166,11 @@ extern struct task_group root_task_group;
 # define INIT_RT_MUTEXES(tsk)
 #endif
 
-#ifdef CONFIG_THREAD_INFO_IN_TASK
-# define INIT_TASK_TI(tsk) .thread_info = INIT_THREAD_INFO(tsk),
+#ifdef CONFIG_KASAN
+# define INIT_KASAN(tsk)						\
+	.kasan_depth = 1,
 #else
-# define INIT_TASK_TI(tsk)
+# define INIT_KASAN(tsk)
 #endif
 
 /*
@@ -180,7 +179,6 @@ extern struct task_group root_task_group;
  */
 #define INIT_TASK(tsk)	\
 {									\
-	INIT_TASK_TI(tsk)						\
 	.state		= 0,						\
 	.stack		= &init_thread_info,				\
 	.usage		= ATOMIC_INIT(2),				\
@@ -249,6 +247,7 @@ extern struct task_group root_task_group;
 	INIT_CPUSET_SEQ(tsk)						\
 	INIT_RT_MUTEXES(tsk)						\
 	INIT_VTIME(tsk)							\
+	INIT_KASAN(tsk)							\
 }
 
 

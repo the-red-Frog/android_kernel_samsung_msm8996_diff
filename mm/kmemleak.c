@@ -98,6 +98,7 @@
 #include <asm/processor.h>
 #include <linux/atomic.h>
 
+#include <linux/kasan.h>
 #include <linux/kmemcheck.h>
 #include <linux/kmemleak.h>
 #include <linux/memory_hotplug.h>
@@ -214,8 +215,18 @@ static unsigned long jiffies_min_age;
 static unsigned long jiffies_last_scan;
 /* delay between automatic memory scannings */
 static signed long jiffies_scan_wait;
-/* enables or disables the task stacks scanning */
+
+/* Enables or disables the task stacks scanning.
+ * Set to 1 if at compile time we want it enabled.
+ * Else set to 0 to have it disabled by default.
+ * This can be enabled by writing to "stack=on" using
+ * kmemleak debugfs entry.*/
+#ifdef CONFIG_DEBUG_TASK_STACK_SCAN_OFF
+static int kmemleak_stack_scan;
+#else
 static int kmemleak_stack_scan = 1;
+#endif
+
 /* protects the memory scanning, parameters and debug/kmemleak file access */
 static DEFINE_MUTEX(scan_mutex);
 /* setting kmemleak=on, will set this var, skipping the disable */
@@ -546,7 +557,7 @@ static struct kmemleak_object *create_object(unsigned long ptr, size_t size,
 	if (in_irq()) {
 		object->pid = 0;
 		strncpy(object->comm, "hardirq", sizeof(object->comm));
-	} else if (in_serving_softirq()) {
+	} else if (in_softirq()) {
 		object->pid = 0;
 		strncpy(object->comm, "softirq", sizeof(object->comm));
 	} else {
@@ -1116,7 +1127,10 @@ static bool update_checksum(struct kmemleak_object *object)
 	if (!kmemcheck_is_obj_initialized(object->pointer, object->size))
 		return false;
 
+	kasan_disable_current();
 	object->checksum = crc32(0, (void *)object->pointer, object->size);
+	kasan_enable_current();
+
 	return object->checksum != old_csum;
 }
 
@@ -1167,7 +1181,9 @@ static void scan_block(void *_start, void *_end,
 						  BYTES_PER_POINTER))
 			continue;
 
+		kasan_disable_current();
 		pointer = *ptr;
+		kasan_enable_current();
 
 		object = find_and_get_object(pointer, 1);
 		if (!object)
@@ -1353,8 +1369,6 @@ static void kmemleak_scan(void)
 			if (page_count(page) == 0)
 				continue;
 			scan_block(page, page + 1, NULL, 1);
-			if (!(pfn % (MAX_SCAN_SIZE / sizeof(*page))))
-				cond_resched();
 		}
 	}
 	put_online_mems();
@@ -1483,7 +1497,8 @@ static void start_scan_thread(void)
 }
 
 /*
- * Stop the automatic memory scanning thread.
+ * Stop the automatic memory scanning thread. This function must be called
+ * with the scan_mutex held.
  */
 static void stop_scan_thread(void)
 {
@@ -1747,15 +1762,12 @@ static void kmemleak_do_cleanup(struct work_struct *work)
 	mutex_lock(&scan_mutex);
 	stop_scan_thread();
 
-	mutex_lock(&scan_mutex);
 	/*
-	 * Once it is made sure that kmemleak_scan has stopped, it is safe to no
-	 * longer track object freeing. Ordering of the scan thread stopping and
-	 * the memory accesses below is guaranteed by the kthread_stop()
-	 * function.
+	 * Once the scan thread has stopped, it is safe to no longer track
+	 * object freeing. Ordering of the scan thread stopping and the memory
+	 * accesses below is guaranteed by the kthread_stop() function.
 	 */
 	kmemleak_free_enabled = 0;
-	mutex_unlock(&scan_mutex);
 
 	if (!kmemleak_found_leaks)
 		__kmemleak_do_cleanup();

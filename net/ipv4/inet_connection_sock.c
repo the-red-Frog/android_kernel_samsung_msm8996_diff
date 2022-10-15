@@ -23,6 +23,9 @@
 #include <net/route.h>
 #include <net/tcp_states.h>
 #include <net/xfrm.h>
+#ifdef CONFIG_MPTCP
+#include <net/mptcp.h>
+#endif
 
 #ifdef INET_CSK_DEBUG
 const char inet_csk_timer_bug_msg[] = "inet_csk BUG: unknown timer value\n";
@@ -85,31 +88,6 @@ int inet_csk_bind_conflict(const struct sock *sk,
 	return sk2 != NULL;
 }
 EXPORT_SYMBOL_GPL(inet_csk_bind_conflict);
-
-void inet_csk_update_fastreuse(struct inet_bind_bucket *tb,
-			       struct sock *sk)
-{
-	kuid_t uid = sock_i_uid(sk);
-
-	if (hlist_empty(&tb->owners)) {
-		if (sk->sk_reuse && sk->sk_state != TCP_LISTEN)
-			tb->fastreuse = 1;
-		else
-			tb->fastreuse = 0;
-		if (sk->sk_reuseport) {
-			tb->fastreuseport = 1;
-			tb->fastuid = uid;
-		} else
-			tb->fastreuseport = 0;
-	} else {
-		if (tb->fastreuse &&
-		    (!sk->sk_reuse || sk->sk_state == TCP_LISTEN))
-			tb->fastreuse = 0;
-		if (tb->fastreuseport &&
-		    (!sk->sk_reuseport || !uid_eq(tb->fastuid, uid)))
-			tb->fastreuseport = 0;
-	}
-}
 
 /* Obtain a reference to a local port for the given sock,
  * if snum is zero it means select any available local port.
@@ -194,6 +172,13 @@ have_snum:
 		head = &hashinfo->bhash[inet_bhashfn(net, snum,
 				hashinfo->bhash_size)];
 		spin_lock(&head->lock);
+
+		if (inet_is_local_reserved_port(net, snum) &&
+		    !sysctl_reserved_port_bind) {
+			ret = 1;
+			goto fail_unlock;
+		}
+
 		inet_bind_bucket_for_each(tb, &head->chain)
 			if (net_eq(ib_net(tb), net) && tb->port == snum)
 				goto tb_found;
@@ -231,9 +216,24 @@ tb_not_found:
 	if (!tb && (tb = inet_bind_bucket_create(hashinfo->bind_bucket_cachep,
 					net, head, snum)) == NULL)
 		goto fail_unlock;
-
-	inet_csk_update_fastreuse(tb, sk);
-
+	if (hlist_empty(&tb->owners)) {
+		if (sk->sk_reuse && sk->sk_state != TCP_LISTEN)
+			tb->fastreuse = 1;
+		else
+			tb->fastreuse = 0;
+		if (sk->sk_reuseport) {
+			tb->fastreuseport = 1;
+			tb->fastuid = uid;
+		} else
+			tb->fastreuseport = 0;
+	} else {
+		if (tb->fastreuse &&
+		    (!sk->sk_reuse || sk->sk_state == TCP_LISTEN))
+			tb->fastreuse = 0;
+		if (tb->fastreuseport &&
+		    (!sk->sk_reuseport || !uid_eq(tb->fastuid, uid)))
+			tb->fastreuseport = 0;
+	}
 success:
 	if (!inet_csk(sk)->icsk_bind_hash)
 		inet_bind_hash(sk, tb, snum);
@@ -477,8 +477,13 @@ no_route:
 }
 EXPORT_SYMBOL_GPL(inet_csk_route_child_sock);
 
+#ifdef CONFIG_MPTCP
+u32 inet_synq_hash(const __be32 raddr, const __be16 rport, const u32 rnd,
+		   const u32 synq_hsize)
+#else
 static inline u32 inet_synq_hash(const __be32 raddr, const __be16 rport,
 				 const u32 rnd, const u32 synq_hsize)
+#endif
 {
 	return jhash_2words((__force u32)raddr, (__force u32)rport, rnd) & (synq_hsize - 1);
 }
@@ -659,7 +664,11 @@ void inet_csk_reqsk_queue_prune(struct sock *parent,
 
 	lopt->clock_hand = i;
 
-	if (lopt->qlen)
+	if (lopt->qlen
+#ifdef CONFIG_MPTCP
+		 && !is_meta_sk(parent)
+#endif
+		 	)
 		inet_csk_reset_keepalive_timer(parent, interval);
 }
 EXPORT_SYMBOL_GPL(inet_csk_reqsk_queue_prune);
@@ -687,7 +696,11 @@ struct sock *inet_csk_clone_lock(const struct sock *sk,
 		inet_sk(newsk)->inet_dport = inet_rsk(req)->ir_rmt_port;
 		inet_sk(newsk)->inet_num = inet_rsk(req)->ir_num;
 		inet_sk(newsk)->inet_sport = htons(inet_rsk(req)->ir_num);
+		inet_sk(newsk)->mc_list = NULL;
+		
 		newsk->sk_write_space = sk_stream_write_space;
+
+		inet_sk(newsk)->mc_list = NULL;
 
 		inet_sk(newsk)->mc_list = NULL;
 
@@ -757,7 +770,11 @@ int inet_csk_listen_start(struct sock *sk, const int nr_table_entries)
 {
 	struct inet_sock *inet = inet_sk(sk);
 	struct inet_connection_sock *icsk = inet_csk(sk);
-	int rc = reqsk_queue_alloc(&icsk->icsk_accept_queue, nr_table_entries);
+	int rc = reqsk_queue_alloc(&icsk->icsk_accept_queue, nr_table_entries
+#ifdef CONFIG_MPTCP
+								, GFP_KERNEL
+#endif
+								);
 
 	if (rc != 0)
 		return rc;
@@ -815,9 +832,18 @@ void inet_csk_listen_stop(struct sock *sk)
 
 	while ((req = acc_req) != NULL) {
 		struct sock *child = req->sk;
+#ifdef CONFIG_MPTCP
+		bool mutex_taken = false;
+#endif
 
 		acc_req = req->dl_next;
 
+#ifdef CONFIG_MPTCP
+		if (is_meta_sk(child)) {
+			mutex_lock(&tcp_sk(child)->mpcb->mpcb_mutex);
+			mutex_taken = true;
+		}
+#endif
 		local_bh_disable();
 		bh_lock_sock(child);
 		WARN_ON(sock_owned_by_user(child));
@@ -846,6 +872,10 @@ void inet_csk_listen_stop(struct sock *sk)
 
 		bh_unlock_sock(child);
 		local_bh_enable();
+#ifdef CONFIG_MPTCP
+		if (mutex_taken)
+			mutex_unlock(&tcp_sk(child)->mpcb->mpcb_mutex);
+#endif
 		sock_put(child);
 
 		sk_acceptq_removed(sk);

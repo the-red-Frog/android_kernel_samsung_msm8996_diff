@@ -48,8 +48,13 @@
 #include <linux/nodemask.h>
 #include <linux/moduleparam.h>
 #include <linux/uaccess.h>
+#include <linux/bug.h>
 
 #include "workqueue_internal.h"
+#ifdef CONFIG_SEC_DEBUG
+#include <linux/qcom/sec_debug.h>
+#endif
+
 
 enum {
 	/*
@@ -281,7 +286,7 @@ static bool wq_power_efficient;
 module_param_named(power_efficient, wq_power_efficient, bool, 0444);
 
 static bool wq_numa_enabled;		/* unbound NUMA affinity enabled */
-
+static unsigned int need_rebind = 0; 
 /* buf for wq_update_unbound_numa_attrs(), protected by CPU hotplug exclusion */
 static struct workqueue_attrs *wq_update_unbound_numa_attrs_buf;
 
@@ -552,16 +557,6 @@ static struct pool_workqueue *unbound_pwq_by_node(struct workqueue_struct *wq,
 						  int node)
 {
 	assert_rcu_or_wq_mutex(wq);
-
-	/*
-	 * XXX: @node can be NUMA_NO_NODE if CPU goes offline while a
-	 * delayed item is pending.  The plan is to keep CPU -> NODE
-	 * mapping valid and stable across CPU on/offlines.  Once that
-	 * happens, this workaround can be removed.
-	 */
-	if (unlikely(node == NUMA_NO_NODE))
-		return wq->dfl_pwq;
-
 	return rcu_dereference_raw(wq->numa_pwq_tbl[node]);
 }
 
@@ -1334,6 +1329,7 @@ static void __queue_work(int cpu, struct workqueue_struct *wq,
 	 */
 	WARN_ON_ONCE(!irqs_disabled());
 
+	debug_work_activate(work);
 
 	/* if draining, only works from the same workqueue are allowed */
 	if (unlikely(wq->flags & __WQ_DRAINING) &&
@@ -1412,7 +1408,6 @@ retry:
 		worklist = &pwq->delayed_works;
 	}
 
-	debug_work_activate(work);
 	insert_work(pwq, work, worklist, work_flags);
 
 	spin_unlock(&pwq->pool->lock);
@@ -2049,6 +2044,14 @@ __acquires(&pool->lock)
 	lock_map_acquire_read(&pwq->wq->lockdep_map);
 	lock_map_acquire(&lockdep_map);
 	trace_workqueue_execute_start(work);
+#ifdef CONFIG_SEC_DEBUG
+	if ((unsigned long)worker->current_func > PAGE_OFFSET) {
+		secdbg_sched_msg("@%pS", worker->current_func);
+	} else {
+		secdbg_sched_msg("M:0x%lx", (unsigned long)worker->current_func);
+	}
+#endif
+
 	worker->current_func(work);
 	/*
 	 * While we must be careful to not use "work" after this, the trace
@@ -2064,6 +2067,7 @@ __acquires(&pool->lock)
 		       current->comm, preempt_count(), task_pid_nr(current),
 		       worker->current_func);
 		debug_show_held_locks(current);
+		BUG_ON(PANIC_CORRUPTION);
 		dump_stack();
 	}
 
@@ -4545,10 +4549,13 @@ static void wq_unbind_fn(struct work_struct *work)
 /**
  * rebind_workers - rebind all workers of a pool to the associated CPU
  * @pool: pool of interest
+ * @force: if it is true, replace WORKER_UNBOUND with WORKER_REBOUND
+ * irrespective of flags of workers. Otherwise, replace the flags only
+ * when workers have WORKER_UNBOUND flag.
  *
  * @pool->cpu is coming online.  Rebind all workers to the CPU.
  */
-static void rebind_workers(struct worker_pool *pool)
+static void rebind_workers(struct worker_pool *pool, bool force)
 {
 	struct worker *worker;
 
@@ -4608,10 +4615,12 @@ static void rebind_workers(struct worker_pool *pool)
 		 * fail incorrectly leading to premature concurrency
 		 * management operations.
 		 */
-		WARN_ON_ONCE(!(worker_flags & WORKER_UNBOUND));
-		worker_flags |= WORKER_REBOUND;
-		worker_flags &= ~WORKER_UNBOUND;
-		ACCESS_ONCE(worker->flags) = worker_flags;
+		if (force || (worker_flags & WORKER_UNBOUND)) {
+			WARN_ON_ONCE(!(worker_flags & WORKER_UNBOUND));
+			worker_flags |= WORKER_REBOUND;
+			worker_flags &= ~WORKER_UNBOUND;
+			ACCESS_ONCE(worker->flags) = worker_flags;
+		}
 	}
 
 	spin_unlock_irq(&pool->lock);
@@ -4673,6 +4682,9 @@ static int workqueue_cpu_up_callback(struct notifier_block *nfb,
 		break;
 
 	case CPU_DOWN_FAILED:
+		if (!(need_rebind&(1<<cpu))) 
+		return NOTIFY_OK; 
+		/* fall through */ 
 	case CPU_ONLINE:
 		mutex_lock(&wq_pool_mutex);
 
@@ -4680,7 +4692,9 @@ static int workqueue_cpu_up_callback(struct notifier_block *nfb,
 			mutex_lock(&pool->attach_mutex);
 
 			if (pool->cpu == cpu)
-				rebind_workers(pool);
+				rebind_workers(pool,
+					(action & ~CPU_TASKS_FROZEN)
+						!= CPU_DOWN_FAILED);
 			else if (pool->cpu < 0)
 				restore_unbound_workers_cpumask(pool, cpu);
 
@@ -4692,6 +4706,7 @@ static int workqueue_cpu_up_callback(struct notifier_block *nfb,
 			wq_update_unbound_numa(wq, cpu, true);
 
 		mutex_unlock(&wq_pool_mutex);
+		need_rebind &= ~(1<<cpu); 
 		break;
 	}
 	return NOTIFY_OK;
@@ -4723,6 +4738,7 @@ static int workqueue_cpu_down_callback(struct notifier_block *nfb,
 
 		/* wait for per-cpu unbinding to finish */
 		flush_work(&unbind_work);
+		need_rebind |= 1<<cpu; 
 		destroy_work_on_stack(&unbind_work);
 		break;
 	}

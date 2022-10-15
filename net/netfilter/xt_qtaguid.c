@@ -1066,6 +1066,18 @@ static struct sock_tag *get_sock_stat_nl(const struct sock *sk)
 	return sock_tag_tree_search(&sock_tag_tree, sk);
 }
 
+static struct sock_tag *get_sock_stat(const struct sock *sk)
+{
+	struct sock_tag *sock_tag_entry;
+	MT_DEBUG("qtaguid: get_sock_stat(sk=%p)\n", sk);
+	if (!sk)
+		return NULL;
+	spin_lock_bh(&sock_tag_list_lock);
+	sock_tag_entry = get_sock_stat_nl(sk);
+	spin_unlock_bh(&sock_tag_list_lock);
+	return sock_tag_entry;
+}
+
 static int ipx_proto(const struct sk_buff *skb,
 		     struct xt_action_param *par)
 {
@@ -1214,6 +1226,12 @@ static void iface_stat_update_from_skb(const struct sk_buff *skb,
 		 par->hooknum, __func__, el_dev->name, el_dev->type,
 		 par->family, proto, direction);
 
+	if (skb->dev && el_dev != skb->dev) {
+		MT_DEBUG("qtaguid[%d]: skb->dev=%p %s vs "
+			"par->(in/out)=%p %s\n",
+			par->hooknum, skb->dev, skb->dev->name, el_dev,
+			el_dev->name);
+	}
 	spin_lock_bh(&iface_stat_list_lock);
 	entry = get_iface_entry(el_dev->name);
 	if (entry == NULL) {
@@ -1302,15 +1320,12 @@ static void if_tag_stat_update(const char *ifname, uid_t uid,
 	 * Look for a tagged sock.
 	 * It will have an acct_uid.
 	 */
-	spin_lock_bh(&sock_tag_list_lock);
-	sock_tag_entry = sk ? get_sock_stat_nl(sk) : NULL;
+	sock_tag_entry = get_sock_stat(sk);
 	if (sock_tag_entry) {
 		tag = sock_tag_entry->tag;
 		acct_tag = get_atag_from_tag(tag);
 		uid_tag = get_utag_from_tag(tag);
-	}
-	spin_unlock_bh(&sock_tag_list_lock);
-	if (!sock_tag_entry) {
+	} else {
 		acct_tag = make_atag_from_value(0);
 		tag = combine_atag_with_uid(acct_tag, uid);
 		uid_tag = make_tag_from_uid(uid);
@@ -1624,6 +1639,13 @@ static void account_for_uid(const struct sk_buff *skb,
 	MT_DEBUG("qtaguid[%d]: dev name=%s type=%d fam=%d proto=%d dir=%d\n",
 		 par->hooknum, el_dev->name, el_dev->type,
 		 par->family, proto, direction);
+
+	if (skb->dev && el_dev != skb->dev) {
+		MT_DEBUG("qtaguid[%d]: skb->dev=%p %s vs "
+			"par->(in/out)=%p %s\n",
+			par->hooknum, skb->dev, skb->dev->name, el_dev,
+			el_dev->name);
+	}
 
 	if_tag_stat_update(el_dev->name, uid,
 			   skb->sk ? skb->sk : alternate_sk,
@@ -2216,7 +2238,7 @@ static int ctrl_cmd_tag(const char *input)
 			from_kuid(&init_user_ns, current_fsuid()));
 		goto err;
 	}
-	CT_DEBUG("qtaguid: ctrl_tag(%s): socket->...->sk_refcnt=%d ->sk=%p\n",
+	CT_DEBUG("qtaguid: ctrl_tag(%s): socket->...->sk_refcnt=%d ->sk=%pk\n",
 		 input, atomic_read(&el_socket->sk->sk_refcnt),
 		 el_socket->sk);
 	if (argc < 3) {
@@ -2322,7 +2344,7 @@ static int ctrl_cmd_tag(const char *input)
 	spin_unlock_bh(&uid_tag_data_tree_lock);
 	spin_unlock_bh(&sock_tag_list_lock);
 	/* We keep the ref to the sk until it is untagged */
-	CT_DEBUG("qtaguid: ctrl_tag(%s): done st@%p ...->sk_refcnt=%d\n",
+	CT_DEBUG("qtaguid: ctrl_tag(%s): done st@%pk ...->sk_refcnt=%d\n",
 		 input, sock_tag_entry,
 		 atomic_read(&el_socket->sk->sk_refcnt));
 	sockfd_put(el_socket);
@@ -2407,20 +2429,15 @@ int qtaguid_untag(struct socket *el_socket, bool kernel)
 	 * At first, we want to catch user-space code that is not
 	 * opening the /dev/xt_qtaguid.
 	 */
-	if (IS_ERR_OR_NULL(pqd_entry))
+	if (IS_ERR_OR_NULL(pqd_entry) || !sock_tag_entry->list.next) {
 		pr_warn_once("qtaguid: %s(): "
 			     "User space forgot to open /dev/xt_qtaguid? "
 			     "pid=%u tgid=%u sk_pid=%u, uid=%u\n", __func__,
 			     current->pid, current->tgid, sock_tag_entry->pid,
 			     from_kuid(&init_user_ns, current_fsuid()));
-	/*
-	 * This check is needed because tagging from a process that
-	 * didn’t open /dev/xt_qtaguid still adds the sock_tag_entry
-	 * to sock_tag_tree.
-	 */
-	if (sock_tag_entry->list.next)
+	} else {
 		list_del(&sock_tag_entry->list);
-
+	}
 	spin_unlock_bh(&uid_tag_data_tree_lock);
 	/*
 	 * We don't free tag_ref from the utd_entry here,
@@ -2432,7 +2449,7 @@ int qtaguid_untag(struct socket *el_socket, bool kernel)
 	 * Release the sock_fd that was grabbed at tag time.
 	 */
 	sock_put(sock_tag_entry->sk);
-	CT_DEBUG("qtaguid: done. st@%p ...->sk_refcnt=%d\n",
+	CT_DEBUG("qtaguid: done. st@%pk ...->sk_refcnt=%d\n",
 		 sock_tag_entry,
 		 atomic_read(&el_socket->sk->sk_refcnt));
 

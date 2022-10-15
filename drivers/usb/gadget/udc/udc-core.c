@@ -57,8 +57,6 @@ static DEFINE_MUTEX(udc_lock);
 int usb_gadget_map_request(struct usb_gadget *gadget,
 		struct usb_request *req, int is_in)
 {
-	struct device *dev = gadget->dev.parent;
-
 	if (req->length == 0)
 		return 0;
 
@@ -68,12 +66,12 @@ int usb_gadget_map_request(struct usb_gadget *gadget,
 		mapped = dma_map_sg(&gadget->dev, req->sg, req->num_sgs,
 				is_in ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 		if (mapped == 0) {
-			dev_err(dev, "failed to map SGs\n");
+			dev_err(&gadget->dev, "failed to map SGs\n");
 			return -EFAULT;
 		}
 
 		req->num_mapped_sgs = mapped;
-	} else {
+	} else if (!req->dma_pre_mapped) {
 		req->dma = dma_map_single(&gadget->dev, req->buf, req->length,
 				is_in ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 
@@ -94,13 +92,20 @@ void usb_gadget_unmap_request(struct usb_gadget *gadget,
 		return;
 
 	if (req->num_mapped_sgs) {
-		dma_unmap_sg(&gadget->dev, req->sg, req->num_sgs,
+		dma_unmap_sg(&gadget->dev, req->sg, req->num_mapped_sgs,
 				is_in ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 
 		req->num_mapped_sgs = 0;
-	} else {
+	} else if (!req->dma_pre_mapped && req->dma != DMA_ERROR_CODE) {
+		/*
+		 * If the DMA address has not been mapped by a higher layer,
+		 * then unmap it here. Otherwise, the DMA address will be
+		 * unmapped by the upper layer (where the request was queued).
+		 */
 		dma_unmap_single(&gadget->dev, req->dma, req->length,
-				is_in ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+			is_in ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+
+		req->dma = DMA_ERROR_CODE;
 	}
 }
 EXPORT_SYMBOL_GPL(usb_gadget_unmap_request);
@@ -303,7 +308,6 @@ err4:
 
 err3:
 	put_device(&udc->dev);
-	device_del(&gadget->dev);
 
 err2:
 	put_device(&gadget->dev);
@@ -403,7 +407,15 @@ static int udc_bind_to_driver(struct usb_udc *udc, struct usb_gadget_driver *dri
 		driver->unbind(udc->gadget);
 		goto err1;
 	}
-	usb_gadget_connect(udc->gadget);
+	/*
+	 * HACK: The Android gadget driver disconnects the gadget
+	 * on bind and expects the gadget to stay disconnected until
+	 * it calls usb_gadget_connect when userspace is ready. Remove
+	 * the call to usb_gadget_connect bellow to avoid enabling the
+	 * pullup before userspace is ready.
+	 *
+	 * usb_gadget_connect(udc->gadget);
+	 */
 
 	kobject_uevent(&udc->dev.kobj, KOBJ_CHANGE);
 	return 0;
@@ -453,8 +465,9 @@ int usb_gadget_probe_driver(struct usb_gadget_driver *driver)
 
 	mutex_lock(&udc_lock);
 	list_for_each_entry(udc, &udc_list, list) {
-		/* For now we take the first one */
-		if (!udc->driver)
+		/* Match according to usb_core_id */
+		if (!udc->driver && udc->gadget
+		    && udc->gadget->usb_core_id == driver->usb_core_id)
 			goto found;
 	}
 
@@ -491,6 +504,7 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 }
 EXPORT_SYMBOL_GPL(usb_gadget_unregister_driver);
 
+
 /* ------------------------------------------------------------------------- */
 
 static ssize_t usb_udc_srp_store(struct device *dev,
@@ -509,13 +523,10 @@ static ssize_t usb_udc_softconn_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t n)
 {
 	struct usb_udc		*udc = container_of(dev, struct usb_udc, dev);
-	ssize_t			ret;
 
-	mutex_lock(&udc_lock);
 	if (!udc->driver) {
 		dev_err(dev, "soft-connect without a gadget driver\n");
-		ret = -EOPNOTSUPP;
-		goto out;
+		return -EOPNOTSUPP;
 	}
 
 	if (sysfs_streq(buf, "connect")) {
@@ -526,14 +537,10 @@ static ssize_t usb_udc_softconn_store(struct device *dev,
 		usb_gadget_udc_stop(udc->gadget, udc->driver);
 	} else {
 		dev_err(dev, "unsupported command '%s'\n", buf);
-		ret = -EINVAL;
-		goto out;
+		return -EINVAL;
 	}
 
-	ret = n;
-out:
-	mutex_unlock(&udc_lock);
-	return ret;
+	return n;
 }
 static DEVICE_ATTR(soft_connect, S_IWUSR, NULL, usb_udc_softconn_store);
 

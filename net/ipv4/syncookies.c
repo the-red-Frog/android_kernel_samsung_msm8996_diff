@@ -16,6 +16,10 @@
 #include <linux/cryptohash.h>
 #include <linux/kernel.h>
 #include <linux/export.h>
+#ifdef CONFIG_MPTCP
+#include <net/mptcp.h>
+#include <net/mptcp_v4.h>
+#endif
 #include <net/tcp.h>
 #include <net/route.h>
 
@@ -291,7 +295,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 		goto out;
 
 	ret = NULL;
-	req = inet_reqsk_alloc(&tcp_request_sock_ops, sk); /* for safety */
+	req = inet_reqsk_alloc(&tcp_request_sock_ops); /* for safety */
 	if (!req)
 		goto out;
 
@@ -348,11 +352,17 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 	/* Try to redo what tcp_v4_send_synack did. */
 	req->window_clamp = tp->window_clamp ? :dst_metric(&rt->dst, RTAX_WINDOW);
 
+#ifdef CONFIG_MPTCP
+	tp->ops->select_initial_window(tcp_full_space(sk), req->mss,
+				       &req->rcv_wnd, &req->window_clamp,
+				       ireq->wscale_ok, &rcv_wscale,
+				       dst_metric(&rt->dst, RTAX_INITRWND), sk);
+#else
 	tcp_select_initial_window(tcp_full_space(sk), req->mss,
 				  &req->rcv_wnd, &req->window_clamp,
 				  ireq->wscale_ok, &rcv_wscale,
 				  dst_metric(&rt->dst, RTAX_INITRWND));
-
+#endif
 	ireq->rcv_wscale  = rcv_wscale;
 
 	ret = get_cookie_sock(sk, skb, req, &rt->dst);

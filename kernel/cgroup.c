@@ -1690,7 +1690,7 @@ static struct dentry *cgroup_mount(struct file_system_type *fs_type,
 {
 	struct super_block *pinned_sb = NULL;
 	struct cgroup_subsys *ss;
-	struct cgroup_root *root;
+	struct cgroup_root *root = NULL;
 	struct cgroup_sb_opts opts;
 	struct dentry *dentry;
 	int ret;
@@ -2327,6 +2327,25 @@ static int cgroup_attach_task(struct cgroup *dst_cgrp,
 	return ret;
 }
 
+int subsys_cgroup_allow_attach(struct cgroup_subsys_state *css, struct cgroup_taskset *tset)
+{
+	const struct cred *cred = current_cred(), *tcred;
+	struct task_struct *task;
+
+	if (capable(CAP_SYS_NICE))
+		return 0;
+
+	cgroup_taskset_for_each(task, tset) {
+		tcred = __task_cred(task);
+
+		if (current != task && !uid_eq(cred->euid, tcred->uid) &&
+		    !uid_eq(cred->euid, tcred->suid))
+			return -EACCES;
+	}
+
+	return 0;
+}
+
 /*
  * Find the task_struct of the task to attach by vpid and pass it along to the
  * function to attach either it or all tasks in its threadgroup. Will lock
@@ -2452,6 +2471,58 @@ static ssize_t cgroup_tasks_write(struct kernfs_open_file *of,
 {
 	return __cgroup_procs_write(of, buf, nbytes, off, false);
 }
+
+#ifdef CONFIG_CGROUP_SCHED
+int cgroup_attach_task_to_root(struct task_struct *tsk, int wait)
+{
+	int ret = 0;
+	struct cgroup *cgrp;
+	struct cgroup *root_cgrp = NULL;
+
+	if (!mutex_trylock(&cgroup_mutex)) {
+		/*This can be a case of recursion, so bail out */
+		if (!wait)
+			return -EBUSY;
+		mutex_lock(&cgroup_mutex);
+	}
+
+	cgrp = task_cgroup(tsk, cpu_cgrp_id);
+
+	if (cgrp && cgrp->root)
+		root_cgrp = &cgrp->root->cgrp;
+
+	if (root_cgrp && cgrp != root_cgrp)
+		cgrp = root_cgrp;
+	else
+		goto out_unlock_cgroup;
+
+	if (cgroup_is_dead(cgrp)) {
+		ret = -ENODEV;
+		goto out_unlock_cgroup;
+	}
+
+	rcu_read_lock();
+
+	get_task_struct(tsk);
+	rcu_read_unlock();
+
+	threadgroup_lock(tsk);
+
+	ret = cgroup_attach_task(cgrp, tsk, false);
+
+	threadgroup_unlock(tsk);
+
+	put_task_struct(tsk);
+out_unlock_cgroup:
+	mutex_unlock(&cgroup_mutex);
+	return ret;
+}
+#else
+int cgroup_attach_task_to_root(struct task_struct *tsk, int wait)
+{
+	return 0;
+}
+#endif
 
 static ssize_t cgroup_procs_write(struct kernfs_open_file *of,
 				  char *buf, size_t nbytes, loff_t off)
@@ -2955,10 +3026,6 @@ static int cgroup_rename(struct kernfs_node *kn, struct kernfs_node *new_parent,
 {
 	struct cgroup *cgrp = kn->priv;
 	int ret;
-
-	/* do not accept '\n' to prevent making /proc/<pid>/cgroup unparsable */
-	if (strchr(new_name_str, '\n'))
-		return -EINVAL;
 
 	if (kernfs_type(kn) != KERNFS_DIR)
 		return -ENOTDIR;
@@ -4323,13 +4390,11 @@ static void css_free_work_fn(struct work_struct *work)
 
 	if (css->ss) {
 		/* css free path */
-		struct cgroup_subsys_state *parent = css->parent;
+		if (css->parent)
+			css_put(css->parent);
 
 		css->ss->css_free(css);
 		cgroup_put(cgrp);
-
-		if (parent)
-			css_put(parent);
 	} else {
 		/* cgroup free path */
 		atomic_dec(&cgrp->root->nr_cgrps);
@@ -4420,7 +4485,6 @@ static void init_and_link_css(struct cgroup_subsys_state *css,
 	memset(css, 0, sizeof(*css));
 	css->cgroup = cgrp;
 	css->ss = ss;
-	css->id = -1;
 	INIT_LIST_HEAD(&css->sibling);
 	INIT_LIST_HEAD(&css->children);
 	css->serial_nr = css_serial_nr_next++;
@@ -5470,7 +5534,7 @@ static int cgroup_css_links_read(struct seq_file *seq, void *v)
 		struct task_struct *task;
 		int count = 0;
 
-		seq_printf(seq, "css_set %p\n", cset);
+		seq_printf(seq, "css_set %pK\n", cset);
 
 		list_for_each_entry(task, &cset->tasks, cg_list) {
 			if (count++ > MAX_TASKS_SHOWN_PER_CSS)

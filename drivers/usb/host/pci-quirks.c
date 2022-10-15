@@ -89,7 +89,6 @@ enum amd_chipset_gen {
 	AMD_CHIPSET_HUDSON2,
 	AMD_CHIPSET_BOLTON,
 	AMD_CHIPSET_YANGTZE,
-	AMD_CHIPSET_TAISHAN,
 	AMD_CHIPSET_UNKNOWN,
 };
 
@@ -137,26 +136,20 @@ static int amd_chipset_sb_type_init(struct amd_chipset_info *pinfo)
 		pinfo->smbus_dev = pci_get_device(PCI_VENDOR_ID_AMD,
 				PCI_DEVICE_ID_AMD_HUDSON2_SMBUS, NULL);
 
-		if (pinfo->smbus_dev) {
-			rev = pinfo->smbus_dev->revision;
-			if (rev >= 0x11 && rev <= 0x14)
-				pinfo->sb_type.gen = AMD_CHIPSET_HUDSON2;
-			else if (rev >= 0x15 && rev <= 0x18)
-				pinfo->sb_type.gen = AMD_CHIPSET_BOLTON;
-			else if (rev >= 0x39 && rev <= 0x3a)
-				pinfo->sb_type.gen = AMD_CHIPSET_YANGTZE;
-		} else {
-			pinfo->smbus_dev = pci_get_device(PCI_VENDOR_ID_AMD,
-							  0x145c, NULL);
-			if (pinfo->smbus_dev) {
-				rev = pinfo->smbus_dev->revision;
-				pinfo->sb_type.gen = AMD_CHIPSET_TAISHAN;
-			} else {
-				pinfo->sb_type.gen = NOT_AMD_CHIPSET;
-				return 0;
-			}
+		if (!pinfo->smbus_dev) {
+			pinfo->sb_type.gen = NOT_AMD_CHIPSET;
+			return 0;
 		}
+
+		rev = pinfo->smbus_dev->revision;
+		if (rev >= 0x11 && rev <= 0x14)
+			pinfo->sb_type.gen = AMD_CHIPSET_HUDSON2;
+		else if (rev >= 0x15 && rev <= 0x18)
+			pinfo->sb_type.gen = AMD_CHIPSET_BOLTON;
+		else if (rev >= 0x39 && rev <= 0x3a)
+			pinfo->sb_type.gen = AMD_CHIPSET_YANGTZE;
 	}
+
 	pinfo->sb_type.rev = rev;
 	return 1;
 }
@@ -178,7 +171,7 @@ int usb_amd_find_chipset_info(void)
 {
 	unsigned long flags;
 	struct amd_chipset_info info;
-	int need_pll_quirk = 0;
+	int ret;
 
 	spin_lock_irqsave(&amd_lock, flags);
 
@@ -192,28 +185,21 @@ int usb_amd_find_chipset_info(void)
 	spin_unlock_irqrestore(&amd_lock, flags);
 
 	if (!amd_chipset_sb_type_init(&info)) {
+		ret = 0;
 		goto commit;
 	}
 
-	switch (info.sb_type.gen) {
-	case AMD_CHIPSET_SB700:
-		need_pll_quirk = info.sb_type.rev <= 0x3B;
-		break;
-	case AMD_CHIPSET_SB800:
-	case AMD_CHIPSET_HUDSON2:
-	case AMD_CHIPSET_BOLTON:
-		need_pll_quirk = 1;
-		break;
-	default:
-		need_pll_quirk = 0;
-		break;
-	}
-
-	if (!need_pll_quirk) {
+	/* Below chipset generations needn't enable AMD PLL quirk */
+	if (info.sb_type.gen == AMD_CHIPSET_UNKNOWN ||
+			info.sb_type.gen == AMD_CHIPSET_SB600 ||
+			info.sb_type.gen == AMD_CHIPSET_YANGTZE ||
+			(info.sb_type.gen == AMD_CHIPSET_SB700 &&
+			info.sb_type.rev > 0x3b)) {
 		if (info.smbus_dev) {
 			pci_dev_put(info.smbus_dev);
 			info.smbus_dev = NULL;
 		}
+		ret = 0;
 		goto commit;
 	}
 
@@ -232,7 +218,7 @@ int usb_amd_find_chipset_info(void)
 		}
 	}
 
-	need_pll_quirk = info.probe_result = 1;
+	ret = info.probe_result = 1;
 	printk(KERN_DEBUG "QUIRK: Enable AMD PLL fix\n");
 
 commit:
@@ -243,7 +229,7 @@ commit:
 
 		/* Mark that we where here */
 		amd_chipset.probe_count++;
-		need_pll_quirk = amd_chipset.probe_result;
+		ret = amd_chipset.probe_result;
 
 		spin_unlock_irqrestore(&amd_lock, flags);
 
@@ -259,7 +245,7 @@ commit:
 		spin_unlock_irqrestore(&amd_lock, flags);
 	}
 
-	return need_pll_quirk;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(usb_amd_find_chipset_info);
 
@@ -267,12 +253,11 @@ int usb_hcd_amd_remote_wakeup_quirk(struct pci_dev *pdev)
 {
 	/* Make sure amd chipset type has already been initialized */
 	usb_amd_find_chipset_info();
-	if (amd_chipset.sb_type.gen == AMD_CHIPSET_YANGTZE ||
-	    amd_chipset.sb_type.gen == AMD_CHIPSET_TAISHAN) {
-		dev_dbg(&pdev->dev, "QUIRK: Enable AMD remote wakeup fix\n");
-		return 1;
-	}
-	return 0;
+	if (amd_chipset.sb_type.gen != AMD_CHIPSET_YANGTZE)
+		return 0;
+
+	dev_dbg(&pdev->dev, "QUIRK: Enable AMD remote wakeup fix\n");
+	return 1;
 }
 EXPORT_SYMBOL_GPL(usb_hcd_amd_remote_wakeup_quirk);
 

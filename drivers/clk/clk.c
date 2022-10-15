@@ -24,6 +24,8 @@
 
 #include "clk.h"
 
+#if defined(CONFIG_COMMON_CLK)
+
 static DEFINE_SPINLOCK(enable_lock);
 static DEFINE_MUTEX(prepare_lock);
 
@@ -1832,9 +1834,6 @@ int clk_set_rate(struct clk *clk, unsigned long rate)
 	clk_change_rate(top);
 
 out:
-	/* Always try to update cached phase if possible */
-	if (clk->ops->get_phase)
-		clk->phase = clk->ops->get_phase(clk->hw);
 	clk_prepare_unlock();
 
 	return ret;
@@ -2633,28 +2632,32 @@ EXPORT_SYMBOL_GPL(clk_notifier_register);
  */
 int clk_notifier_unregister(struct clk *clk, struct notifier_block *nb)
 {
-	struct clk_notifier *cn;
-	int ret = -ENOENT;
+	struct clk_notifier *cn = NULL;
+	int ret = -EINVAL;
 
 	if (!clk || !nb)
 		return -EINVAL;
 
 	clk_prepare_lock();
 
-	list_for_each_entry(cn, &clk_notifier_list, node) {
-		if (cn->clk == clk) {
-			ret = srcu_notifier_chain_unregister(&cn->notifier_head, nb);
-
-			clk->notifier_count--;
-
-			/* XXX the notifier code should handle this better */
-			if (!cn->notifier_head.head) {
-				srcu_cleanup_notifier_head(&cn->notifier_head);
-				list_del(&cn->node);
-				kfree(cn);
-			}
+	list_for_each_entry(cn, &clk_notifier_list, node)
+		if (cn->clk == clk)
 			break;
+
+	if (cn->clk == clk) {
+		ret = srcu_notifier_chain_unregister(&cn->notifier_head, nb);
+
+		clk->notifier_count--;
+
+		/* XXX the notifier code should handle this better */
+		if (!cn->notifier_head.head) {
+			srcu_cleanup_notifier_head(&cn->notifier_head);
+			list_del(&cn->node);
+			kfree(cn);
 		}
+
+	} else {
+		ret = -ENOENT;
 	}
 
 	clk_prepare_unlock();
@@ -2662,6 +2665,8 @@ int clk_notifier_unregister(struct clk *clk, struct notifier_block *nb)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(clk_notifier_unregister);
+
+#endif /* CONFIG_COMMON_CLK */
 
 #ifdef CONFIG_OF
 /**
@@ -2704,6 +2709,8 @@ struct clk *of_clk_src_simple_get(struct of_phandle_args *clkspec,
 }
 EXPORT_SYMBOL_GPL(of_clk_src_simple_get);
 
+#if defined(CONFIG_COMMON_CLK)
+
 struct clk *of_clk_src_onecell_get(struct of_phandle_args *clkspec, void *data)
 {
 	struct clk_onecell_data *clk_data = data;
@@ -2717,6 +2724,11 @@ struct clk *of_clk_src_onecell_get(struct of_phandle_args *clkspec, void *data)
 	return clk_data->clks[idx];
 }
 EXPORT_SYMBOL_GPL(of_clk_src_onecell_get);
+
+#endif /* CONFIG_COMMON_CLK */
+
+/* forward declaration */
+void of_clk_del_provider(struct device_node *np);
 
 /**
  * of_clk_add_provider() - Register a clock provider for a node
@@ -2849,6 +2861,8 @@ const char *of_clk_get_parent_name(struct device_node *np, int index)
 }
 EXPORT_SYMBOL_GPL(of_clk_get_parent_name);
 
+#if defined(CONFIG_COMMON_CLK)
+
 struct clock_provider {
 	of_clk_init_cb_t clk_init_cb;
 	struct device_node *np;
@@ -2946,4 +2960,7 @@ void __init of_clk_init(const struct of_device_id *matches)
 			force = true;
 	}
 }
+
+#endif /* CONFIG_COMMON_CLK */
+
 #endif

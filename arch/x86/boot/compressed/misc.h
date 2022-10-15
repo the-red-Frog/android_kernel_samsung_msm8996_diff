@@ -9,6 +9,10 @@
  */
 #undef CONFIG_PARAVIRT
 #undef CONFIG_PARAVIRT_SPINLOCKS
+#undef CONFIG_KASAN
+#ifdef CONFIG_X86_32
+#define _ASM_X86_DESC_H 1
+#endif
 
 #include <linux/linkage.h>
 #include <linux/screen_info.h>
@@ -17,6 +21,7 @@
 #include <asm/page.h>
 #include <asm/boot.h>
 #include <asm/bootparam.h>
+#include <asm/bootparam_utils.h>
 
 #define BOOT_BOOT_H
 #include "../ctype.h"

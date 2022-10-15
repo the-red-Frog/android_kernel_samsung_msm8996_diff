@@ -1,4 +1,5 @@
 #include <linux/export.h>
+#include <linux/kasan.h>
 #include <linux/sched.h>
 #include <linux/stacktrace.h>
 
@@ -19,19 +20,6 @@
  * A simple function epilogue looks like this:
  *	ldm	sp, {fp, sp, pc}
  *
- * When compiled with clang, pc and sp are not pushed. A simple function
- * prologue looks like this when built with clang:
- *
- *	stmdb	{..., fp, lr}
- *	add	fp, sp, #x
- *	sub	sp, sp, #y
- *
- * A simple function epilogue looks like this when built with clang:
- *
- *	sub	sp, fp, #x
- *	ldm	{..., fp, pc}
- *
- *
  * Note that with framepointer enabled, even the leaf functions have the same
  * prologue and epilogue, therefore we can ignore the LR value in this case.
  */
@@ -44,25 +32,18 @@ int notrace unwind_frame(struct stackframe *frame)
 	low = frame->sp;
 	high = ALIGN(low, THREAD_SIZE);
 
-#ifdef CONFIG_CC_IS_CLANG
-	/* check current frame pointer is within bounds */
-	if (fp < low + 4 || fp > high - 4)
-		return -EINVAL;
-
-	frame->sp = frame->fp;
-	frame->fp = *(unsigned long *)(fp);
-	frame->pc = frame->lr;
-	frame->lr = *(unsigned long *)(fp + 4);
-#else
 	/* check current frame pointer is within bounds */
 	if (fp < low + 12 || fp > high - 4)
 		return -EINVAL;
+
+	kasan_disable_current();
 
 	/* restore the registers from the stack frame */
 	frame->fp = *(unsigned long *)(fp - 12);
 	frame->sp = *(unsigned long *)(fp - 8);
 	frame->pc = *(unsigned long *)(fp - 4);
-#endif
+
+	kasan_enable_current();
 
 	return 0;
 }
@@ -196,6 +177,7 @@ void save_stack_trace_tsk(struct task_struct *tsk, struct stack_trace *trace)
 {
 	__save_stack_trace(tsk, trace, 1);
 }
+EXPORT_SYMBOL(save_stack_trace_tsk);
 
 void save_stack_trace(struct stack_trace *trace)
 {

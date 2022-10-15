@@ -58,6 +58,7 @@ static const char netdev_features_strings[NETDEV_FEATURE_COUNT][ETH_GSTRING_LEN]
 	[NETIF_F_IP_CSUM_BIT] =          "tx-checksum-ipv4",
 	[NETIF_F_HW_CSUM_BIT] =          "tx-checksum-ip-generic",
 	[NETIF_F_IPV6_CSUM_BIT] =        "tx-checksum-ipv6",
+	[NETIF_F_IPV6_UDP_CSUM_BIT] =    "tx-checksum-ipv6-udp",
 	[NETIF_F_HIGHDMA_BIT] =          "highdma",
 	[NETIF_F_FRAGLIST_BIT] =         "tx-scatter-gather-fraglist",
 	[NETIF_F_HW_VLAN_CTAG_TX_BIT] =  "tx-vlan-hw-insert",
@@ -211,7 +212,8 @@ static netdev_features_t ethtool_get_feature_mask(u32 eth_cmd)
 	switch (eth_cmd) {
 	case ETHTOOL_GTXCSUM:
 	case ETHTOOL_STXCSUM:
-		return NETIF_F_ALL_CSUM | NETIF_F_SCTP_CSUM;
+		return NETIF_F_ALL_CSUM | NETIF_F_SCTP_CSUM |
+			NETIF_F_IPV6_UDP_CSUM;
 	case ETHTOOL_GRXCSUM:
 	case ETHTOOL_SRXCSUM:
 		return NETIF_F_RXCSUM;
@@ -404,13 +406,8 @@ static noinline_for_stack int ethtool_get_drvinfo(struct net_device *dev,
 		if (rc >= 0)
 			info.n_priv_flags = rc;
 	}
-	if (ops->get_regs_len) {
-		int ret = ops->get_regs_len(dev);
-
-		if (ret > 0)
-			info.regdump_len = ret;
-	}
-
+	if (ops->get_regs_len)
+		info.regdump_len = ops->get_regs_len(dev);
 	if (ops->get_eeprom_len)
 		info.eedump_len = ops->get_eeprom_len(dev);
 
@@ -861,21 +858,12 @@ static int ethtool_get_regs(struct net_device *dev, char __user *useraddr)
 		return -EFAULT;
 
 	reglen = ops->get_regs_len(dev);
-	if (reglen <= 0)
-		return reglen;
-
 	if (regs.len > reglen)
 		regs.len = reglen;
 
-	regbuf = NULL;
-	if (reglen) {
-		regbuf = vzalloc(reglen);
-		if (!regbuf)
-			return -ENOMEM;
-	}
-
-	if (regs.len < reglen)
-		reglen = regs.len;
+	regbuf = vzalloc(reglen);
+	if (reglen && !regbuf)
+		return -ENOMEM;
 
 	ops->get_regs(dev, &regs, regbuf);
 
@@ -883,7 +871,7 @@ static int ethtool_get_regs(struct net_device *dev, char __user *useraddr)
 	if (copy_to_user(useraddr, &regs, sizeof(regs)))
 		goto out;
 	useraddr += offsetof(struct ethtool_regs, data);
-	if (copy_to_user(useraddr, regbuf, reglen))
+	if (regbuf && copy_to_user(useraddr, regbuf, regs.len))
 		goto out;
 	ret = 0;
 

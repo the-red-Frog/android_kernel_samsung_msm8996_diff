@@ -1150,7 +1150,8 @@ static void brcmf_link_down(struct brcmf_cfg80211_vif *vif)
 			brcmf_err("WLC_DISASSOC failed (%d)\n", err);
 		}
 		clear_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state);
-		cfg80211_disconnected(vif->wdev.netdev, 0, NULL, 0, GFP_KERNEL);
+		cfg80211_disconnected(vif->wdev.netdev, 0, NULL, 0,
+					true, GFP_KERNEL);
 
 	}
 	clear_bit(BRCMF_VIF_STATUS_CONNECTING, &vif->sme_state);
@@ -1815,7 +1816,7 @@ brcmf_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 		return -EIO;
 
 	clear_bit(BRCMF_VIF_STATUS_CONNECTED, &ifp->vif->sme_state);
-	cfg80211_disconnected(ndev, reason_code, NULL, 0, GFP_KERNEL);
+	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
 
 	memcpy(&scbval.ea, &profile->bssid, ETH_ALEN);
 	scbval.val = cpu_to_le32(reason_code);
@@ -3040,7 +3041,6 @@ brcmf_notify_sched_scan_results(struct brcmf_if *ifp,
 	struct brcmf_pno_scanresults_le *pfn_result;
 	u32 result_count;
 	u32 status;
-	u32 datalen;
 
 	brcmf_dbg(SCAN, "Enter\n");
 
@@ -3062,14 +3062,6 @@ brcmf_notify_sched_scan_results(struct brcmf_if *ifp,
 	if (result_count > 0) {
 		int i;
 
-		data += sizeof(struct brcmf_pno_scanresults_le);
-		netinfo_start = (struct brcmf_pno_net_info_le *)data;
-		datalen = e->datalen - ((void *)netinfo_start - (void *)pfn_result);
-		if (datalen < result_count * sizeof(*netinfo)) {
-			brcmf_err("insufficient event data\n");
-			goto out_err;
-		}
-
 		request = kzalloc(sizeof(*request), GFP_KERNEL);
 		ssid = kcalloc(result_count, sizeof(*ssid), GFP_KERNEL);
 		channel = kcalloc(result_count, sizeof(*channel), GFP_KERNEL);
@@ -3079,6 +3071,9 @@ brcmf_notify_sched_scan_results(struct brcmf_if *ifp,
 		}
 
 		request->wiphy = wiphy;
+		data += sizeof(struct brcmf_pno_scanresults_le);
+		netinfo_start = (struct brcmf_pno_net_info_le *)data;
+
 		for (i = 0; i < result_count; i++) {
 			netinfo = &netinfo_start[i];
 			if (!netinfo) {
@@ -3088,8 +3083,6 @@ brcmf_notify_sched_scan_results(struct brcmf_if *ifp,
 				goto out_err;
 			}
 
-			if (netinfo->SSID_len > IEEE80211_MAX_SSID_LEN)
-				netinfo->SSID_len = IEEE80211_MAX_SSID_LEN;
 			brcmf_dbg(SCAN, "SSID:%s Channel:%d\n",
 				  netinfo->SSID, netinfo->channel);
 			memcpy(ssid[i].ssid, netinfo->SSID, netinfo->SSID_len);
@@ -4466,8 +4459,6 @@ static s32 brcmf_get_assoc_ies(struct brcmf_cfg80211_info *cfg,
 		conn_info->req_ie =
 		    kmemdup(cfg->extra_buf, conn_info->req_ie_len,
 			    GFP_KERNEL);
-		if (!conn_info->req_ie)
-			conn_info->req_ie_len = 0;
 	} else {
 		conn_info->req_ie_len = 0;
 		conn_info->req_ie = NULL;
@@ -4484,8 +4475,6 @@ static s32 brcmf_get_assoc_ies(struct brcmf_cfg80211_info *cfg,
 		conn_info->resp_ie =
 		    kmemdup(cfg->extra_buf, conn_info->resp_ie_len,
 			    GFP_KERNEL);
-		if (!conn_info->resp_ie)
-			conn_info->resp_ie_len = 0;
 	} else {
 		conn_info->resp_ie_len = 0;
 		conn_info->resp_ie = NULL;

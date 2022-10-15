@@ -33,6 +33,8 @@ static int all_versions = 0;
 static int external_module = 0;
 /* Warn about section mismatch in vmlinux if set to 1 */
 static int vmlinux_section_warnings = 1;
+/* Exit with an error when there is a section mismatch if set to 1 */
+static int section_error_on_mismatch;
 /* Only warn about unresolved symbols */
 static int warn_unresolved = 0;
 /* How a symbol is exported */
@@ -1925,14 +1927,6 @@ static void add_intree_flag(struct buffer *b, int is_intree)
 		buf_printf(b, "\nMODULE_INFO(intree, \"Y\");\n");
 }
 
-/* Cannot check for assembler */
-static void add_retpoline(struct buffer *b)
-{
-	buf_printf(b, "\n#ifdef RETPOLINE\n");
-	buf_printf(b, "MODULE_INFO(retpoline, \"Y\");\n");
-	buf_printf(b, "#endif\n");
-}
-
 static void add_staging_flag(struct buffer *b, const char *name)
 {
 	static const char *staging_dir = "drivers/staging";
@@ -2182,7 +2176,7 @@ int main(int argc, char **argv)
 	struct ext_sym_list *extsym_iter;
 	struct ext_sym_list *extsym_start = NULL;
 
-	while ((opt = getopt(argc, argv, "i:I:e:mnsST:o:awM:K:")) != -1) {
+	while ((opt = getopt(argc, argv, "i:I:e:mnsST:o:awM:K:E")) != -1) {
 		switch (opt) {
 		case 'i':
 			kernel_read = optarg;
@@ -2222,6 +2216,9 @@ int main(int argc, char **argv)
 			break;
 		case 'w':
 			warn_unresolved = 1;
+			break;
+		case 'E':
+			section_error_on_mismatch = 1;
 			break;
 		default:
 			exit(1);
@@ -2263,7 +2260,6 @@ int main(int argc, char **argv)
 
 		add_header(&buf, mod);
 		add_intree_flag(&buf, !external_module);
-		add_retpoline(&buf);
 		add_staging_flag(&buf, mod->name);
 		err |= add_versions(&buf, mod);
 		add_depends(&buf, mod, modules);
@@ -2276,11 +2272,23 @@ int main(int argc, char **argv)
 
 	if (dump_write)
 		write_dump(dump_write);
-	if (sec_mismatch_count && !sec_mismatch_verbose)
-		warn("modpost: Found %d section mismatch(es).\n"
-		     "To see full details build your kernel with:\n"
-		     "'make CONFIG_DEBUG_SECTION_MISMATCH=y'\n",
-		     sec_mismatch_count);
+
+	if (sec_mismatch_count && !sec_mismatch_verbose) {
+		merror(
+		"modpost: Found %d section mismatch(es).\n"
+		"To see full details build your kernel with:\n"
+		"'make CONFIG_DEBUG_SECTION_MISMATCH=y'\n",
+		sec_mismatch_count);
+
+	}
+
+	if (sec_mismatch_count && section_error_on_mismatch) {
+		err |= 1;
+		printf(
+		"To build the kernel despite the mismatches, "
+		"build with:\n'make CONFIG_NO_ERROR_ON_MISMATCH=y'\n"
+		"(NOTE: This is not recommended)\n");
+	}
 
 	return err;
 }

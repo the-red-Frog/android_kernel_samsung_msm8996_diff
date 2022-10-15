@@ -30,6 +30,7 @@
 #include <linux/bug.h>
 #include <linux/compiler.h>
 #include <linux/sort.h>
+#include <linux/dma-mapping.h>
 
 #include <asm/unified.h>
 #include <asm/cp15.h>
@@ -104,6 +105,14 @@ EXPORT_SYMBOL(elf_hwcap);
 unsigned int elf_hwcap2 __read_mostly;
 EXPORT_SYMBOL(elf_hwcap2);
 
+char* (*arch_read_hardware_id)(void);
+EXPORT_SYMBOL(arch_read_hardware_id);
+
+unsigned int boot_reason;
+EXPORT_SYMBOL(boot_reason);
+
+unsigned int cold_boot;
+EXPORT_SYMBOL(cold_boot);
 
 #ifdef MULTI_CPU
 struct processor processor __read_mostly;
@@ -471,11 +480,9 @@ void notrace cpu_init(void)
 	 * In Thumb-2, msr with an immediate value is not allowed.
 	 */
 #ifdef CONFIG_THUMB2_KERNEL
-#define PLC_l	"l"
-#define PLC_r	"r"
+#define PLC	"r"
 #else
-#define PLC_l	"I"
-#define PLC_r	"I"
+#define PLC	"I"
 #endif
 
 	/*
@@ -497,15 +504,15 @@ void notrace cpu_init(void)
 	"msr	cpsr_c, %9"
 	    :
 	    : "r" (stk),
-	      PLC_r (PSR_F_BIT | PSR_I_BIT | IRQ_MODE),
+	      PLC (PSR_F_BIT | PSR_I_BIT | IRQ_MODE),
 	      "I" (offsetof(struct stack, irq[0])),
-	      PLC_r (PSR_F_BIT | PSR_I_BIT | ABT_MODE),
+	      PLC (PSR_F_BIT | PSR_I_BIT | ABT_MODE),
 	      "I" (offsetof(struct stack, abt[0])),
-	      PLC_r (PSR_F_BIT | PSR_I_BIT | UND_MODE),
+	      PLC (PSR_F_BIT | PSR_I_BIT | UND_MODE),
 	      "I" (offsetof(struct stack, und[0])),
-	      PLC_r (PSR_F_BIT | PSR_I_BIT | FIQ_MODE),
+	      PLC (PSR_F_BIT | PSR_I_BIT | FIQ_MODE),
 	      "I" (offsetof(struct stack, fiq[0])),
-	      PLC_l (PSR_F_BIT | PSR_I_BIT | SVC_MODE)
+	      PLC (PSR_F_BIT | PSR_I_BIT | SVC_MODE)
 	    : "r14");
 #endif
 }
@@ -910,11 +917,14 @@ void __init hyp_mode_check(void)
 #endif
 }
 
+void __init __weak init_random_pool(void) { }
+
 void __init setup_arch(char **cmdline_p)
 {
 	const struct machine_desc *mdesc;
 
 	setup_processor();
+	early_ioremap_init();
 	mdesc = setup_machine_fdt(__atags_pointer);
 	if (!mdesc)
 		mdesc = setup_machine_tags(__atags_pointer, __machine_arch_type);
@@ -982,6 +992,8 @@ void __init setup_arch(char **cmdline_p)
 
 	if (mdesc->init_early)
 		mdesc->init_early();
+
+	init_random_pool();
 }
 
 
@@ -997,7 +1009,7 @@ static int __init topology_init(void)
 
 	return 0;
 }
-subsys_initcall(topology_init);
+postcore_initcall(topology_init);
 
 #ifdef CONFIG_HAVE_PROC_CPU
 static int __init proc_cpu_init(void)
@@ -1052,7 +1064,7 @@ static int c_show(struct seq_file *m, void *v)
 	int i, j;
 	u32 cpuid;
 
-	for_each_online_cpu(i) {
+	for_each_present_cpu(i) {
 		/*
 		 * glibc reads /proc/cpuinfo to determine the number of
 		 * online processors, looking for lines beginning with
@@ -1106,10 +1118,15 @@ static int c_show(struct seq_file *m, void *v)
 		seq_printf(m, "CPU revision\t: %d\n\n", cpuid & 15);
 	}
 
-	seq_printf(m, "Hardware\t: %s\n", machine_name);
+	if (!arch_read_hardware_id)
+		seq_printf(m, "Hardware\t: %s\n", machine_name);
+	else
+		seq_printf(m, "Hardware\t: %s\n", arch_read_hardware_id());
 	seq_printf(m, "Revision\t: %04x\n", system_rev);
 	seq_printf(m, "Serial\t\t: %08x%08x\n",
 		   system_serial_high, system_serial_low);
+	seq_printf(m, "Processor\t: %s rev %d (%s)\n",
+		   cpu_name, read_cpuid_id() & 15, elf_platform);
 
 	return 0;
 }
@@ -1135,3 +1152,9 @@ const struct seq_operations cpuinfo_op = {
 	.stop	= c_stop,
 	.show	= c_show
 };
+
+void arch_setup_pdev_archdata(struct platform_device *pdev)
+{
+	pdev->archdata.dma_mask = DMA_BIT_MASK(32);
+	pdev->dev.dma_mask = &pdev->archdata.dma_mask;
+}

@@ -47,6 +47,10 @@
 #include <asm/tlb.h>
 #include <asm/mmu_context.h>
 
+#ifdef CONFIG_MSM_APP_SETTINGS
+#include <asm/app_api.h>
+#endif
+
 #include "internal.h"
 
 #ifndef arch_mmap_check
@@ -58,8 +62,8 @@
 #endif
 
 #ifdef CONFIG_HAVE_ARCH_MMAP_RND_BITS
-const int mmap_rnd_bits_min = CONFIG_ARCH_MMAP_RND_BITS_MIN;
-const int mmap_rnd_bits_max = CONFIG_ARCH_MMAP_RND_BITS_MAX;
+int mmap_rnd_bits_min = CONFIG_ARCH_MMAP_RND_BITS_MIN;
+int mmap_rnd_bits_max = CONFIG_ARCH_MMAP_RND_BITS_MAX;
 int mmap_rnd_bits __read_mostly = CONFIG_ARCH_MMAP_RND_BITS;
 #endif
 #ifdef CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS
@@ -659,6 +663,7 @@ void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
 	 * immediately update the gap to the correct value. Finally we
 	 * rebalance the rbtree after all augmented values have been set.
 	 */
+	smp_mb();
 	rb_link_node(&vma->vm_rb, rb_parent, rb_link);
 	vma->rb_subtree_gap = 0;
 	vma_gap_update(vma);
@@ -1321,7 +1326,6 @@ static inline bool file_mmap_ok(struct file *file, struct inode *inode,
 /*
  * The caller must hold down_write(&current->mm->mmap_sem).
  */
-
 unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 			unsigned long len, unsigned long prot,
 			unsigned long flags, unsigned long pgoff,
@@ -1332,6 +1336,14 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 
 	*populate = 0;
 
+    while (file && (file->f_mode & FMODE_NONMAPPABLE))
+        file = file->f_op->get_lower_file(file);
+
+#ifdef CONFIG_MSM_APP_SETTINGS
+	if (use_app_setting)
+		apply_app_setting_bit(file);
+#endif
+
 	/*
 	 * Does the application expect PROT_READ to imply PROT_EXEC?
 	 *
@@ -1339,7 +1351,7 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 	 *  mounted, in which case we dont add PROT_EXEC.)
 	 */
 	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
-		if (!(file && (file->f_path.mnt->mnt_flags & MNT_NOEXEC)))
+		if (!(file && path_noexec(&file->f_path)))
 			prot |= PROT_EXEC;
 
 	if (!len)
@@ -1414,7 +1426,7 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 		case MAP_PRIVATE:
 			if (!(file->f_mode & FMODE_READ))
 				return -EACCES;
-			if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
+			if (path_noexec(&file->f_path)) {
 				if (vm_flags & VM_EXEC)
 					return -EPERM;
 				vm_flags &= ~VM_MAYEXEC;
@@ -1989,9 +2001,19 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma, *prev;
 	struct vm_unmapped_area_info info;
+	static DEFINE_RATELIMIT_STATE(mmap_rs, DEFAULT_RATELIMIT_INTERVAL,
+						DEFAULT_RATELIMIT_BURST);
 
-	if (len > TASK_SIZE - mmap_min_addr)
+	if (len > TASK_SIZE - mmap_min_addr) {
+		if (__ratelimit(&mmap_rs)) {
+			printk(KERN_ERR "%s %d - (len > TASK_SIZE - mmap_min_addr) len=0x%lx "
+				"TASK_SIZE=0x%lx mmap_min_addr=0x%lx pid=%d total_vm=0x%lx addr=0x%lx\n",
+				__func__, __LINE__,
+				len, TASK_SIZE, mmap_min_addr, current->pid,
+				current->mm->total_vm, addr);
+		}
 		return -ENOMEM;
+	}
 
 	if (flags & MAP_FIXED)
 		return addr;
@@ -2010,8 +2032,19 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 	info.low_limit = mm->mmap_base;
 	info.high_limit = TASK_SIZE;
 	info.align_mask = 0;
-	info.align_offset = 0;
-	return vm_unmapped_area(&info);
+	addr = vm_unmapped_area(&info);
+	if (addr == -ENOMEM) {
+		if (__ratelimit(&mmap_rs)) {
+			printk(KERN_ERR "%s %d - NOMEM from vm_unmapped_area "
+				"pid=%d total_vm=0x%lx flags=0x%lx length=0x%lx low_limit=0x%lx "
+				"high_limit=0x%lx align_mask=0x%lx\n",
+				__func__, __LINE__,
+				current->pid, current->mm->total_vm,
+				info.flags, info.length, info.low_limit,
+				info.high_limit, info.align_mask);
+		}
+	}
+	return addr;
 }
 #endif
 
@@ -2029,10 +2062,20 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 	struct mm_struct *mm = current->mm;
 	unsigned long addr = addr0;
 	struct vm_unmapped_area_info info;
+	static DEFINE_RATELIMIT_STATE(mmap_rs, DEFAULT_RATELIMIT_INTERVAL,
+						DEFAULT_RATELIMIT_BURST);
 
 	/* requested length too big for entire address space */
-	if (len > TASK_SIZE - mmap_min_addr)
+	if (len > TASK_SIZE - mmap_min_addr) {
+		if (__ratelimit(&mmap_rs)) {
+			printk(KERN_ERR "%s %d - (len > TASK_SIZE - mmap_min_addr) len=%lx "
+				"TASK_SIZE=0x%lx mmap_min_addr=0x%lx pid=%d total_vm=0x%lx addr=0x%lx\n",
+				__func__, __LINE__,
+				len, TASK_SIZE, mmap_min_addr, current->pid,
+				current->mm->total_vm, addr);
+		}
 		return -ENOMEM;
+	}
 
 	if (flags & MAP_FIXED)
 		return addr;
@@ -2052,7 +2095,6 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
 	info.high_limit = mm->mmap_base;
 	info.align_mask = 0;
-	info.align_offset = 0;
 	addr = vm_unmapped_area(&info);
 
 	/*
@@ -2067,6 +2109,17 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 		info.low_limit = TASK_UNMAPPED_BASE;
 		info.high_limit = TASK_SIZE;
 		addr = vm_unmapped_area(&info);
+	}
+	if (addr == -ENOMEM) {
+		if (__ratelimit(&mmap_rs)) {
+			printk(KERN_ERR "%s %d - NOMEM from vm_unmapped_area "
+				"pid=%d total_vm=0x%lx flags=0x%lx length=0x%lx low_limit=0x%lx "
+				"high_limit=0x%lx align_mask=0x%lx\n",
+				__func__, __LINE__,
+				current->pid, current->mm->total_vm,
+				info.flags, info.length, info.low_limit,
+				info.high_limit, info.align_mask);
+		}
 	}
 
 	return addr;
@@ -2225,7 +2278,7 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 {
 	struct vm_area_struct *next;
 	unsigned long gap_addr;
-	int error = 0;
+        int error = 0;
 
 	if (!(vma->vm_flags & VM_GROWSUP))
 		return -EFAULT;
@@ -2736,6 +2789,10 @@ static unsigned long do_brk(unsigned long addr, unsigned long len)
 	pgoff_t pgoff = addr >> PAGE_SHIFT;
 	int error;
 
+	len = PAGE_ALIGN(len);
+	if (!len)
+		return addr;
+
 	flags = VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
 
 	error = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
@@ -2804,18 +2861,11 @@ out:
 	return addr;
 }
 
-unsigned long vm_brk(unsigned long addr, unsigned long request)
+unsigned long vm_brk(unsigned long addr, unsigned long len)
 {
 	struct mm_struct *mm = current->mm;
-	unsigned long len;
 	unsigned long ret;
 	bool populate;
-
-	len = PAGE_ALIGN(request);
-	if (len < request)
-		return -ENOMEM;
-	if (!len)
-		return addr;
 
 	down_write(&mm->mmap_sem);
 	ret = do_brk(addr, len);
@@ -2870,7 +2920,6 @@ void exit_mmap(struct mm_struct *mm)
 		if (vma->vm_flags & VM_ACCOUNT)
 			nr_accounted += vma_pages(vma);
 		vma = remove_vma(vma);
-		cond_resched();
 	}
 	vm_unacct_memory(nr_accounted);
 

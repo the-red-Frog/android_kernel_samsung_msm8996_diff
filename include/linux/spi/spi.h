@@ -361,9 +361,6 @@ struct spi_master {
 #define SPI_MASTER_MUST_RX      BIT(3)		/* requires rx */
 #define SPI_MASTER_MUST_TX      BIT(4)		/* requires tx */
 
-	/* flag indicating this is a non-devres managed controller */
-	bool			devm_allocated;
-
 	/* lock and mutex for SPI bus locking */
 	spinlock_t		bus_lock_spinlock;
 	struct mutex		bus_lock_mutex;
@@ -501,8 +498,6 @@ extern void spi_finalize_current_transfer(struct spi_master *master);
 /* the spi driver core manages memory for the spi_master classdev */
 extern struct spi_master *
 spi_alloc_master(struct device *host, unsigned size);
-extern struct spi_master *
-devm_spi_alloc_master(struct device *dev, unsigned int size);
 
 extern int spi_register_master(struct spi_master *master);
 extern int devm_spi_register_master(struct device *dev,
@@ -779,6 +774,16 @@ extern int spi_sync_locked(struct spi_device *spi, struct spi_message *message);
 extern int spi_bus_lock(struct spi_master *master);
 extern int spi_bus_unlock(struct spi_master *master);
 
+extern int ese_spi_clock_set_rate(struct spi_device *spidev);
+extern int ese_spi_clock_enable(struct spi_device *spidev);
+extern int ese_spi_clock_disable(struct spi_device *spidev);
+extern int ese_spi_request_gpios(struct spi_device *spidev);
+#ifdef ENABLE_SENSORS_FPRINT_SECURE
+extern int fp_spi_clock_set_rate(struct spi_device *spidev);
+extern int fp_spi_clock_enable(struct spi_device *spidev);
+extern int fp_spi_clock_disable(struct spi_device *spidev);
+extern int fp_spi_request_gpios(struct spi_device *spidev);
+#endif
 /**
  * spi_write - SPI synchronous write
  * @spi: device to which data will be written

@@ -30,6 +30,9 @@
 
 struct inet_bind_bucket;
 struct tcp_congestion_ops;
+#ifdef CONFIG_MPTCP
+struct tcp_options_received;
+#endif
 
 /*
  * Pointers to address related TCP functions
@@ -254,6 +257,11 @@ inet_csk_rto_backoff(const struct inet_connection_sock *icsk,
 
 struct sock *inet_csk_accept(struct sock *sk, int flags, int *err);
 
+#ifdef CONFIG_MPTCP
+u32 inet_synq_hash(const __be32 raddr, const __be16 rport, const u32 rnd,
+		   const u32 synq_hsize);
+#endif
+
 struct request_sock *inet_csk_search_req(const struct sock *sk,
 					 struct request_sock ***prevp,
 					 const __be16 rport,
@@ -295,6 +303,11 @@ static inline void inet_csk_reqsk_queue_added(struct sock *sk,
 static inline int inet_csk_reqsk_queue_len(const struct sock *sk)
 {
 	return reqsk_queue_len(&inet_csk(sk)->icsk_accept_queue);
+}
+
+static inline int inet_csk_reqsk_queue_young(const struct sock *sk)
+{
+	return reqsk_queue_len_young(&inet_csk(sk)->icsk_accept_queue);
 }
 
 static inline int inet_csk_reqsk_queue_is_full(const struct sock *sk)
@@ -344,10 +357,6 @@ int inet_csk_compat_getsockopt(struct sock *sk, int level, int optname,
 			       char __user *optval, int __user *optlen);
 int inet_csk_compat_setsockopt(struct sock *sk, int level, int optname,
 			       char __user *optval, unsigned int optlen);
-
-/* update the fast reuse flag when adding a socket */
-void inet_csk_update_fastreuse(struct inet_bind_bucket *tb,
-			       struct sock *sk);
 
 struct dst_entry *inet_csk_update_pmtu(struct sock *sk, u32 mtu);
 #endif /* _INET_CONNECTION_SOCK_H */

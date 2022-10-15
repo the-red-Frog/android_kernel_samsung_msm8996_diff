@@ -85,9 +85,17 @@
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
 
+#ifdef CONFIG_SEC_GPIO_DVS
+#include <linux/secgpio_dvs.h>
+#endif
+
 #ifdef CONFIG_X86_LOCAL_APIC
 #include <asm/smp.h>
 #endif
+
+#ifdef CONFIG_TIMA_RKP
+#include <linux/rkp_entry.h>
+#endif //CONFIG_TIMA_RKP
 
 static int kernel_init(void *);
 
@@ -121,6 +129,7 @@ void (*__initdata late_time_init)(void);
 char __initdata boot_command_line[COMMAND_LINE_SIZE];
 /* Untouched saved command line (eg. for /proc) */
 char *saved_command_line;
+char *erased_command_line;
 /* Command line for parameter parsing */
 static char *static_command_line;
 /* Command line for per-initcall parameter parsing */
@@ -147,6 +156,13 @@ EXPORT_SYMBOL_GPL(static_key_initialized);
  */
 unsigned int reset_devices;
 EXPORT_SYMBOL(reset_devices);
+
+#ifdef CONFIG_KNOX_KAP
+int boot_mode_security;
+EXPORT_SYMBOL(boot_mode_security);
+#endif
+
+int ddr_size_6g;
 
 static int __init set_reset_devices(char *str)
 {
@@ -232,8 +248,28 @@ static int __init loglevel(char *str)
 
 early_param("loglevel", loglevel);
 
+#ifdef CONFIG_SEC_BSP
+unsigned int is_boot_recovery;
+EXPORT_SYMBOL(is_boot_recovery);
+
+static int __init boot_recovery(char *str)
+{
+	int temp = 0;
+
+	if (get_option(&str, &temp)) {
+		is_boot_recovery = temp;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+early_param("androidboot.boot_recovery", boot_recovery);
+#endif
+
 /* Change NUL term back to "=", to make "param" the whole string. */
-static int __init repair_env_string(char *param, char *val, const char *unused)
+static int __init repair_env_string(char *param, char *val,
+				    const char *unused, void *arg)
 {
 	if (val) {
 		/* param=val or param="val"? */
@@ -250,14 +286,15 @@ static int __init repair_env_string(char *param, char *val, const char *unused)
 }
 
 /* Anything after -- gets handed straight to init. */
-static int __init set_init_arg(char *param, char *val, const char *unused)
+static int __init set_init_arg(char *param, char *val,
+			       const char *unused, void *arg)
 {
 	unsigned int i;
 
 	if (panic_later)
 		return 0;
 
-	repair_env_string(param, val, unused);
+	repair_env_string(param, val, unused, NULL);
 
 	for (i = 0; argv_init[i]; i++) {
 		if (i == MAX_INIT_ARGS) {
@@ -274,9 +311,10 @@ static int __init set_init_arg(char *param, char *val, const char *unused)
  * Unknown boot options get handed to init, unless they look like
  * unused parameters (modprobe will find them in /proc/cmdline).
  */
-static int __init unknown_bootoption(char *param, char *val, const char *unused)
+static int __init unknown_bootoption(char *param, char *val,
+				     const char *unused, void *arg)
 {
-	repair_env_string(param, val, unused);
+	repair_env_string(param, val, unused, NULL);
 
 	/* Handle obsolete-style parameters */
 	if (obsolete_checksetup(param))
@@ -369,10 +407,13 @@ static void __init setup_command_line(char *command_line)
 {
 	saved_command_line =
 		memblock_virt_alloc(strlen(boot_command_line) + 1, 0);
+	erased_command_line =
+		memblock_virt_alloc(strlen(boot_command_line) + 1, 0);
 	initcall_command_line =
 		memblock_virt_alloc(strlen(boot_command_line) + 1, 0);
 	static_command_line = memblock_virt_alloc(strlen(command_line) + 1, 0);
 	strcpy(saved_command_line, boot_command_line);
+	strcpy(erased_command_line, boot_command_line);
 	strcpy(static_command_line, command_line);
 }
 
@@ -392,6 +433,7 @@ static noinline void __init_refok rest_init(void)
 	int pid;
 
 	rcu_scheduler_starting();
+	smpboot_thread_init();
 	/*
 	 * We need to spawn init first so that it obtains pid 1, however
 	 * the init task will end up wanting to create kthreads, which, if
@@ -416,7 +458,8 @@ static noinline void __init_refok rest_init(void)
 }
 
 /* Check for early params. */
-static int __init do_early_param(char *param, char *val, const char *unused)
+static int __init do_early_param(char *param, char *val,
+				 const char *unused, void *arg)
 {
 	const struct obs_kernel_param *p;
 
@@ -430,12 +473,30 @@ static int __init do_early_param(char *param, char *val, const char *unused)
 		}
 	}
 	/* We accept everything at this stage. */
+#ifdef CONFIG_KNOX_KAP
+	if ((strncmp(param, "androidboot.security_mode", 26) == 0)) {
+		pr_warn("val = %d\n",*val);
+	        if ((strncmp(val, "1526595585", 10) == 0)) {
+				pr_info("Security Boot Mode \n");
+				boot_mode_security = 1;
+			}
+	}
+#endif
+	if ((strncmp(param, "androidboot.ddr_size", 27) == 0)) {
+		pr_warn("val = %d\n",*val);
+	        if ((strncmp(val, "6", 2) == 0)) {
+				pr_info("Ramsize is 6G \n");
+				ddr_size_6g = 1;
+			}
+	}
+
 	return 0;
 }
 
 void __init parse_early_options(char *cmdline)
 {
-	parse_args("early options", cmdline, NULL, 0, 0, 0, do_early_param);
+	parse_args("early options", cmdline, NULL, 0, 0, 0, NULL,
+		   do_early_param);
 }
 
 /* Arch code calls this early on, or if not, just before other parsing. */
@@ -494,10 +555,79 @@ static void __init mm_init(void)
 	vmalloc_init();
 }
 
+#ifdef  CONFIG_TIMA_RKP
+__attribute__((section(".rkp.bitmap"))) u8 rkp_pgt_bitmap_arr[0x30000] = {0};
+__attribute__((section(".rkp.dblmap"))) u8 rkp_map_bitmap_arr[0x30000] = {0};
+u8 rkp_started = 0;
+static void rkp_init(void)
+{
+	rkp_init_t init;
+	init.magic = RKP_INIT_MAGIC;
+	init.vmalloc_start = VMALLOC_START;
+	init.vmalloc_end = (u64)high_memory;
+	init.init_mm_pgd = (u64)__pa(swapper_pg_dir);
+	init.id_map_pgd = (u64)__pa(idmap_pg_dir);
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+	init.tramp_pgd = (u64)__pa(tramp_pg_dir);
+#endif
+	init.rkp_pgt_bitmap = (u64)__pa(rkp_pgt_bitmap);
+	init.rkp_map_bitmap = (u64)__pa(rkp_map_bitmap);
+	init.rkp_pgt_bitmap_size = RKP_PGT_BITMAP_LEN;
+	init.zero_pg_addr = (u64)__pa(empty_zero_page);
+	init._text = (u64) _text;
+	init._etext = (u64) _etext;
+	init._srodata = (u64) __start_rodata;
+	init._erodata =(u64) __end_rodata;
+	if (memstart_addr == 0x40000000)
+		init.large_memory = 1;
+	else
+		init.large_memory = 0;
+	rkp_call(RKP_INIT, (u64)&init, (u64)memstart_addr, (u64)max_pfn, 0, 0);
+	rkp_started = 1;
+	return;
+}
+#endif
+#ifdef CONFIG_RKP_KDP
+
+void kdp_init(void)
+{
+	kdp_init_t cred;
+	cred.credSize 	= sizeof(struct cred);
+	cred.sp_size	= rkp_get_task_sec_size();
+	cred.pgd_mm 	= offsetof(struct mm_struct,pgd);
+	cred.uid_cred	= offsetof(struct cred,uid);
+	cred.euid_cred	= offsetof(struct cred,euid);
+	cred.gid_cred	= offsetof(struct cred,gid);
+	cred.egid_cred	= offsetof(struct cred,egid);
+
+	cred.bp_pgd_cred 	= offsetof(struct cred,bp_pgd);
+	cred.bp_task_cred 	= offsetof(struct cred,bp_task);
+	cred.type_cred 		= offsetof(struct cred,type);
+	cred.security_cred 	= offsetof(struct cred,security);
+	cred.usage_cred 	= offsetof(struct cred,use_cnt);
+
+	cred.cred_task  	= offsetof(struct task_struct,cred);
+	cred.mm_task 		= offsetof(struct task_struct,mm);
+	cred.pid_task		= offsetof(struct task_struct,pid);
+	cred.rp_task		= offsetof(struct task_struct,real_parent);
+	cred.comm_task 		= offsetof(struct task_struct,comm);
+
+	cred.bp_cred_secptr 	= rkp_get_offset_bp_cred();
+
+	cred.task_threadinfo = offsetof(struct thread_info,task);
+	rkp_call(RKP_CMDID(0x40),(u64)&cred,0,0,0,0);
+}
+#endif /*CONFIG_RKP_KDP*/
 asmlinkage __visible void __init start_kernel(void)
 {
 	char *command_line;
 	char *after_dashes;
+#ifdef CONFIG_SAMSUNG_PRODUCT_SHIP
+	char *erase_cmd_start, *erase_cmd_end;
+	char *erase_string[] = {"ap_serial=0x", "serialno=", "em.did="};
+	size_t len, value_len;
+	unsigned int i, j;
+#endif
 
 	/*
 	 * Need to run as early as possible, to initialize the
@@ -507,11 +637,6 @@ asmlinkage __visible void __init start_kernel(void)
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
 	debug_objects_early_init();
-
-	/*
-	 * Set up the the initial canary ASAP:
-	 */
-	boot_init_stack_canary();
 
 	cgroup_init_early();
 
@@ -526,6 +651,10 @@ asmlinkage __visible void __init start_kernel(void)
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	setup_arch(&command_line);
+	/*
+	 * Set up the the initial canary ASAP:
+	 */
+	boot_init_stack_canary();
 	mm_init_cpumask(&init_mm);
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
@@ -535,17 +664,38 @@ asmlinkage __visible void __init start_kernel(void)
 	build_all_zonelists(NULL, NULL);
 	page_alloc_init();
 
+#ifndef CONFIG_SAMSUNG_PRODUCT_SHIP
 	pr_notice("Kernel command line: %s\n", boot_command_line);
+#else
+	for (i = 0; i < ARRAY_SIZE(erase_string); i++) {
+		len = strlen(erase_string[i]);
+		erase_cmd_start = strstr(erased_command_line, erase_string[i]);
+		if (erase_cmd_start == NULL)
+			continue;
+
+		erase_cmd_end = strstr(erase_cmd_start, " ");
+
+		if ( (erase_cmd_end != NULL) && (erase_cmd_start != NULL)
+				&& (erase_cmd_end > erase_cmd_start) ) {
+			value_len = (size_t)(erase_cmd_end - erase_cmd_start) - len;
+
+			for (j = 0; j < value_len; j++) {
+				erase_cmd_start[len + j] = '0';
+			}
+		}
+	}
+	pr_notice("Kernel command line: %s\n", erased_command_line);
+#endif
 	/* parameters may set static keys */
 	jump_label_init();
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",
 				  static_command_line, __start___param,
 				  __stop___param - __start___param,
-				  -1, -1, &unknown_bootoption);
+				  -1, -1, NULL, &unknown_bootoption);
 	if (!IS_ERR_OR_NULL(after_dashes))
 		parse_args("Setting init args", after_dashes, NULL, 0, -1, -1,
-			   set_init_arg);
+			   NULL, set_init_arg);
 
 	/*
 	 * These use large bootmem allocations and must precede
@@ -649,12 +799,32 @@ asmlinkage __visible void __init start_kernel(void)
 	init_espfix_bsp();
 #endif
 	thread_info_cache_init();
+#ifdef CONFIG_TIMA_RKP
+	rkp_init();
+#ifdef CONFIG_RKP_CFP_ROPP
+	rkp_call(CFP_ROPP_INIT, 0, 0, 0, 0, 0);
+#endif
+#ifdef CONFIG_RKP_CFP_JOPP
+	rkp_call(CFP_JOPP_INIT, 0, 0, 0, 0, 0);
+#endif
+#ifdef CONFIG_RKP_KDP
+	rkp_cred_enable = 1;
+#endif /*CONFIG_RKP_KDP*/
+#ifdef CONFIG_RKP_KDP
+	if (rkp_cred_enable) 
+		kdp_init();
+#endif /*CONFIG_RKP_KDP*/
+#endif /* CONFIG_TIMA_RKP */
 	cred_init();
 	fork_init(totalram_pages);
 	proc_caches_init();
 	buffer_init();
 	key_init();
 	security_init();
+#ifdef CONFIG_RKP_KDP
+	if (rkp_cred_enable) 
+		rkp_call(RKP_CMDID(0x51),(u64)__rkp_ro_start,0,0,0,0);
+#endif /*CONFIG_RKP_KDP*/
 	dbg_late_init();
 	vfs_caches_init(totalram_pages);
 	signals_init();
@@ -680,8 +850,6 @@ asmlinkage __visible void __init start_kernel(void)
 
 	/* Do the rest non-__init'ed, we're now alive */
 	rest_init();
-
-	prevent_tail_call_optimization();
 }
 
 /* Call all constructor functions linked into the kernel. */
@@ -854,7 +1022,7 @@ static void __init do_initcall_level(int level)
 		   initcall_command_line, __start___param,
 		   __stop___param - __start___param,
 		   level, level,
-		   &repair_env_string);
+		   NULL, &repair_env_string);
 
 	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
 		do_one_initcall(*fn);
@@ -929,6 +1097,34 @@ static int try_to_run_init_process(const char *init_filename)
 	return ret;
 }
 
+#ifdef CONFIG_DEFERRED_INITCALLS
+extern initcall_t __deferred_initcall_start[], __deferred_initcall_end[];
+
+/* call deferred init routines */
+void __ref do_deferred_initcalls(void)
+{
+	initcall_t *call;
+	static int already_run=0;
+
+	if (already_run) {
+		printk("do_deferred_initcalls() has already run\n");
+		return;
+	}
+
+	already_run=1;
+
+	printk("Running do_deferred_initcalls()\n");
+
+	for(call = __deferred_initcall_start;
+	    call < __deferred_initcall_end; call++)
+		do_one_initcall(*call);
+
+	flush_scheduled_work();
+
+	free_initmem();
+}
+#endif
+
 static noinline void __init kernel_init_freeable(void);
 
 #ifdef CONFIG_DEBUG_RODATA
@@ -958,9 +1154,21 @@ static int __ref kernel_init(void *unused)
 	int ret;
 
 	kernel_init_freeable();
+
+#ifdef CONFIG_SEC_GPIO_DVS
+	/************************ Caution !!! ****************************/
+	/* This function must be located in appropriate INIT position
+	 * in accordance with the specification of each BB vendor.
+	 */
+	/************************ Caution !!! ****************************/
+	gpio_dvs_check_initgpio();
+#endif
+
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
+#ifndef CONFIG_DEFERRED_INITCALLS
 	free_initmem();
+#endif
 	mark_readonly();
 	system_state = SYSTEM_RUNNING;
 	numa_default_policy();
@@ -1017,7 +1225,7 @@ static noinline void __init kernel_init_freeable(void)
 	 */
 	set_cpus_allowed_ptr(current, cpu_all_mask);
 
-	cad_pid = get_pid(task_pid(current));
+	cad_pid = task_pid(current);
 
 	smp_prepare_cpus(setup_max_cpus);
 

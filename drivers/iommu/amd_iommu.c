@@ -989,7 +989,7 @@ again:
 	next_tail = (tail + sizeof(*cmd)) % iommu->cmd_buf_size;
 	left      = (head - next_tail) % iommu->cmd_buf_size;
 
-	if (left <= 0x20) {
+	if (left <= 2) {
 		struct iommu_cmd sync_cmd;
 		volatile u64 sem = 0;
 		int ret;
@@ -1987,9 +1987,6 @@ static void dma_ops_domain_free(struct dma_ops_domain *dom)
 		kfree(dom->aperture[i]);
 	}
 
-	if (dom->domain.id)
-		domain_id_free(dom->domain.id);
-
 	kfree(dom);
 }
 
@@ -2327,8 +2324,6 @@ static int attach_device(struct device *dev,
 	 * here to evict all dirty stuff.
 	 */
 	domain_flush_tlb_pde(domain);
-
-	domain_flush_complete(domain);
 
 	return ret;
 }
@@ -3445,6 +3440,7 @@ static const struct iommu_ops amd_iommu_ops = {
 	.detach_dev = amd_iommu_detach_device,
 	.map = amd_iommu_map,
 	.unmap = amd_iommu_unmap,
+	.map_sg = default_iommu_map_sg,
 	.iova_to_phys = amd_iommu_iova_to_phys,
 	.pgsize_bitmap	= AMD_IOMMU_PGSIZES,
 };
@@ -3877,7 +3873,7 @@ union irte {
 
 #define DTE_IRQ_PHYS_ADDR_MASK	(((1ULL << 45)-1) << 6)
 #define DTE_IRQ_REMAP_INTCTL    (2ULL << 60)
-#define DTE_IRQ_TABLE_LEN       (9ULL << 1)
+#define DTE_IRQ_TABLE_LEN       (8ULL << 1)
 #define DTE_IRQ_REMAP_ENABLE    1ULL
 
 static void set_dte_irq_entry(u16 devid, struct irq_remap_table *table)

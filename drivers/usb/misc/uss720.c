@@ -715,11 +715,6 @@ static int uss720_probe(struct usb_interface *intf,
 
 	interface = intf->cur_altsetting;
 
-	if (interface->desc.bNumEndpoints < 3) {
-		usb_put_dev(usbdev);
-		return -ENODEV;
-	}
-
 	/*
 	 * Allocate parport interface 
 	 */
@@ -757,7 +752,6 @@ static int uss720_probe(struct usb_interface *intf,
 	parport_announce_port(pp);
 
 	usb_set_intfdata(intf, pp);
-	usb_put_dev(usbdev);
 	return 0;
 
 probe_abort:

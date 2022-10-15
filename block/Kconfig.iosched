@@ -2,6 +2,19 @@ if BLOCK
 
 menu "IO Schedulers"
 
+config IOSCHED_ANXIETY
+	tristate "Anxiety I/O scheduler"
+	default y
+	---help---
+	  Anxiety is a low-latency I/O scheduler designed for use in
+	  embedded devices with flash storage. It attempts to provide
+	  unfair request bias, batching synchronous requests together
+	  at the expense of delaying asynchronous requests. By
+	  definition, synchronous requests are essentially "holding up"
+	  the current processes until they are dispatched. By biasing
+	  and batching synchronous requests, process initialization is
+	  expedited.
+
 config IOSCHED_NOOP
 	bool
 	default y
@@ -11,6 +24,17 @@ config IOSCHED_NOOP
 	  memory devices, and specialised software or hardware environments
 	  that do their own scheduling and require only minimal assistance from
 	  the kernel.
+
+config IOSCHED_TEST
+	tristate "Test I/O scheduler"
+	depends on DEBUG_FS
+	default m
+	---help---
+	  The test I/O scheduler is a duplicate of the noop scheduler with
+	  addition of test utlity.
+	  It allows testing a block device by dispatching specific requests
+	  according to the test case and declare PASS/FAIL according to the
+	  requests completion error code.
 
 config IOSCHED_DEADLINE
 	tristate "Deadline I/O scheduler"
@@ -39,6 +63,27 @@ config CFQ_GROUP_IOSCHED
 	---help---
 	  Enable group IO scheduling in CFQ.
 
+config IOSCHED_BFQ
+	tristate "BFQ I/O scheduler"
+	default n
+	---help---
+	  The BFQ I/O scheduler tries to distribute bandwidth among
+	  all processes according to their weights.
+	  It aims at distributing the bandwidth as desired, independently of
+	  the disk parameters and with any workload. It also tries to
+	  guarantee low latency to interactive and soft real-time
+	  applications. If compiled built-in (saying Y here), BFQ can
+	  be configured to support hierarchical scheduling.
+
+config CGROUP_BFQIO
+	bool "BFQ hierarchical scheduling support"
+	depends on CGROUPS && IOSCHED_BFQ=y
+	default n
+	---help---
+	  Enable hierarchical scheduling in BFQ, using the cgroups
+	  filesystem interface.  The name of the subsystem will be
+	  bfqio.
+
 choice
 	prompt "Default I/O scheduler"
 	default DEFAULT_CFQ
@@ -52,8 +97,21 @@ choice
 	config DEFAULT_CFQ
 		bool "CFQ" if IOSCHED_CFQ=y
 
+	config DEFAULT_BFQ
+		bool "BFQ" if IOSCHED_BFQ=y
+		help
+		  Selects BFQ as the default I/O scheduler which will be
+		  used by default for all block devices.
+		  The BFQ I/O scheduler aims at distributing the bandwidth
+		  as desired, independently of the disk parameters and with
+		  any workload. It also tries to guarantee low latency to
+		  interactive and soft real-time applications.
+
 	config DEFAULT_NOOP
 		bool "No-op"
+
+	config DEFAULT_ANXIETY
+		bool "Anxiety" if IOSCHED_ANXIETY=y
 
 endchoice
 
@@ -61,7 +119,9 @@ config DEFAULT_IOSCHED
 	string
 	default "deadline" if DEFAULT_DEADLINE
 	default "cfq" if DEFAULT_CFQ
+	default "bfq" if DEFAULT_BFQ
 	default "noop" if DEFAULT_NOOP
+	default "anxiety" if DEFAULT_ANXIETY
 
 endmenu
 

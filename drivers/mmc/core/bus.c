@@ -26,6 +26,12 @@
 #include "sdio_cis.h"
 #include "bus.h"
 
+#ifdef CONFIG_MMC_SUPPORT_STLOG
+#include <linux/fslog.h>
+#else
+#define ST_LOG(fmt,...)
+#endif
+
 #define to_mmc_driver(d)	container_of(d, struct mmc_driver, drv)
 
 static ssize_t type_show(struct device *dev,
@@ -129,8 +135,19 @@ static void mmc_bus_shutdown(struct device *dev)
 {
 	struct mmc_driver *drv = to_mmc_driver(dev->driver);
 	struct mmc_card *card = mmc_dev_to_card(dev);
-	struct mmc_host *host = card->host;
+	struct mmc_host *host;
 	int ret;
+
+	if (!drv) {
+		pr_debug("%s: %s: drv is NULL\n", dev_name(dev), __func__);
+		return;
+	}
+
+	if (!card) {
+		pr_debug("%s: %s: card is NULL\n", dev_name(dev), __func__);
+		return;
+	} else
+		host = card->host;
 
 	if (dev->driver && drv->shutdown)
 		drv->shutdown(card);
@@ -157,9 +174,25 @@ static int mmc_bus_suspend(struct device *dev)
 			return ret;
 	}
 
+#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
+	if (mmc_bus_needs_resume(host))
+		return 0;
+#endif
+
 	ret = host->bus_ops->suspend(host);
-	if (ret)
-		pm_generic_resume(dev);
+
+	/*
+	 * bus_ops->suspend may fail due to some reason
+	 * In such cases if we return error to PM framework
+	 * from here without calling drv->resume then mmc
+	 * request may get stuck since PM framework will assume
+	 * that mmc bus is not suspended (because of error) and
+	 * it won't call resume again.
+	 *
+	 * So in case of error call drv->resume.
+	 */
+	if (ret && dev->driver && drv->resume)
+		drv->resume(card);
 
 	return ret;
 }
@@ -169,12 +202,20 @@ static int mmc_bus_resume(struct device *dev)
 	struct mmc_driver *drv = to_mmc_driver(dev->driver);
 	struct mmc_card *card = mmc_dev_to_card(dev);
 	struct mmc_host *host = card->host;
-	int ret;
+	int ret = 0;
 
-	ret = host->bus_ops->resume(host);
-	if (ret)
-		pr_warn("%s: error %d during resume (card was removed?)\n",
-			mmc_hostname(host), ret);
+#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
+	if (mmc_bus_manual_resume(host)) {
+		host->bus_resume_flags |= MMC_BUSRESUME_NEEDS_RESUME;
+	} else {
+#else
+	{
+#endif
+		ret = host->bus_ops->resume(host);
+		if (ret)
+			pr_warn("%s: error %d during resume (card was removed?)\n",
+					mmc_hostname(host), ret);
+	}
 
 	if (dev->driver && drv->resume)
 		ret = drv->resume(card);
@@ -199,6 +240,7 @@ static int mmc_runtime_resume(struct device *dev)
 
 	return host->bus_ops->runtime_resume(host);
 }
+
 #endif /* !CONFIG_PM_RUNTIME */
 
 static const struct dev_pm_ops mmc_bus_pm_ops = {
@@ -282,6 +324,9 @@ struct mmc_card *mmc_alloc_card(struct mmc_host *host, struct device_type *type)
 	card->dev.release = mmc_release_card;
 	card->dev.type = type;
 
+	spin_lock_init(&card->wr_pack_stats.lock);
+	spin_lock_init(&card->bkops.stats.lock);
+
 	return card;
 }
 
@@ -349,12 +394,27 @@ int mmc_add_card(struct mmc_card *card)
 			(mmc_card_hs200(card) ? "HS200 " : ""),
 			mmc_card_ddr52(card) ? "DDR " : "",
 			uhs_bus_speed_mode, type, card->rca);
+		ST_LOG("%s: %s%s%s%s(clk %u) %s card\n",
+			mmc_hostname(card->host),
+			mmc_card_uhs(card) ? "ultra high speed " :
+			(mmc_card_hs(card) ? "high speed " : ""),
+			mmc_card_hs400(card) ? "HS400 " :
+			(mmc_card_hs200(card) ? "HS200 " : ""),
+			mmc_card_ddr52(card) ? "DDR " : "",
+			uhs_bus_speed_mode, card->host->ios.clock, type);
 	}
 
 #ifdef CONFIG_DEBUG_FS
 	mmc_add_card_debugfs(card);
 #endif
 	mmc_init_context_info(card->host);
+
+	if (mmc_card_sdio(card)) {
+		ret = device_init_wakeup(&card->dev, true);
+		if (ret)
+			pr_err("%s: %s: failed to init wakeup: %d\n",
+			       mmc_hostname(card->host), __func__, ret);
+	}
 
 	card->dev.of_node = mmc_of_find_child_device(card->host, 0);
 
@@ -363,6 +423,7 @@ int mmc_add_card(struct mmc_card *card)
 		return ret;
 
 	mmc_card_set_present(card);
+	device_enable_async_suspend(&card->dev);
 
 	return 0;
 }
@@ -384,10 +445,15 @@ void mmc_remove_card(struct mmc_card *card)
 		} else {
 			pr_info("%s: card %04x removed\n",
 				mmc_hostname(card->host), card->rca);
+			ST_LOG("%s: card %04x removed\n",
+				mmc_hostname(card->host), card->rca);
 		}
 		device_del(&card->dev);
 		of_node_put(card->dev.of_node);
 	}
+
+	kfree(card->wr_pack_stats.packing_events);
+	kfree(card->cached_ext_csd);
 
 	put_device(&card->dev);
 }

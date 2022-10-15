@@ -241,12 +241,10 @@ int ocfs2_set_acl(handle_t *handle,
 	case ACL_TYPE_ACCESS:
 		name_index = OCFS2_XATTR_INDEX_POSIX_ACL_ACCESS;
 		if (acl) {
-			umode_t mode;
-
+			umode_t mode = inode->i_mode;
 			ret = posix_acl_update_mode(inode, &mode, &acl);
 			if (ret)
 				return ret;
-
 			ret = ocfs2_acl_set_mode(inode, di_bh,
 						 handle, mode);
 			if (ret)
@@ -324,8 +322,8 @@ int ocfs2_acl_chmod(struct inode *inode, struct buffer_head *bh)
 	down_read(&OCFS2_I(inode)->ip_xattr_sem);
 	acl = ocfs2_get_acl_nolock(inode, ACL_TYPE_ACCESS, bh);
 	up_read(&OCFS2_I(inode)->ip_xattr_sem);
-	if (IS_ERR_OR_NULL(acl))
-		return PTR_ERR_OR_ZERO(acl);
+	if (IS_ERR(acl) || !acl)
+		return PTR_ERR(acl);
 	ret = __posix_acl_chmod(&acl, GFP_KERNEL, inode->i_mode);
 	if (ret)
 		return ret;

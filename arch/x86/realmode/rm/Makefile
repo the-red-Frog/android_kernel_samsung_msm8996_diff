@@ -6,6 +6,13 @@
 # for more details.
 #
 #
+KASAN_SANITIZE := n
+
+# Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
+KCOV_INSTRUMENT		:= n
+
+# Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
+KCOV_INSTRUMENT		:= n
 
 always := realmode.bin realmode.relocs
 
@@ -42,7 +49,7 @@ $(obj)/pasyms.h: $(REALMODE_OBJS) FORCE
 targets += realmode.lds
 $(obj)/realmode.lds: $(obj)/pasyms.h
 
-LDFLAGS_realmode.elf := -m elf_i386 --emit-relocs -T
+LDFLAGS_realmode.elf := --emit-relocs -T
 CPPFLAGS_realmode.lds += -P -C -I$(obj)
 
 targets += realmode.elf
@@ -69,3 +76,4 @@ KBUILD_CFLAGS	:= $(LINUXINCLUDE) $(REALMODE_CFLAGS) -D_SETUP -D_WAKEUP \
 		   -I$(srctree)/arch/x86/boot
 KBUILD_AFLAGS	:= $(KBUILD_CFLAGS) -D__ASSEMBLY__
 GCOV_PROFILE := n
+UBSAN_SANITIZE := n

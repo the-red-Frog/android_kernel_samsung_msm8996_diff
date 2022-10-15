@@ -267,7 +267,7 @@ struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb,
 	int flush = 1;
 
 	if (NAPI_GRO_CB(skb)->encap_mark ||
-	    (uh->check && skb->ip_summed != CHECKSUM_PARTIAL &&
+	    (skb->ip_summed != CHECKSUM_PARTIAL &&
 	     NAPI_GRO_CB(skb)->csum_cnt == 0 &&
 	     !NAPI_GRO_CB(skb)->csum_valid))
 		goto out;
@@ -306,7 +306,7 @@ unflush:
 	skb_gro_pull(skb, sizeof(struct udphdr)); /* pull encapsulating udp header */
 	skb_gro_postpull_rcsum(skb, uh, sizeof(struct udphdr));
 	NAPI_GRO_CB(skb)->proto = uo_priv->offload->ipproto;
-	pp = uo_priv->offload->callbacks.gro_receive(head, skb);
+	pp = call_gro_receive(uo_priv->offload->callbacks.gro_receive, head, skb);
 
 out_unlock:
 	rcu_read_unlock();

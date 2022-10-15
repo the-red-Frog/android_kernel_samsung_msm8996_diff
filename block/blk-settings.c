@@ -274,8 +274,6 @@ EXPORT_SYMBOL(blk_limits_max_hw_sectors);
 void blk_queue_max_hw_sectors(struct request_queue *q, unsigned int max_hw_sectors)
 {
 	blk_limits_max_hw_sectors(&q->limits, max_hw_sectors);
-	q->backing_dev_info.io_pages =
-			q->limits.max_sectors >> (PAGE_SHIFT - 9);
 }
 EXPORT_SYMBOL(blk_queue_max_hw_sectors);
 
@@ -375,7 +373,7 @@ EXPORT_SYMBOL(blk_queue_max_segment_size);
  *   storage device can address.  The default of 512 covers most
  *   hardware.
  **/
-void blk_queue_logical_block_size(struct request_queue *q, unsigned int size)
+void blk_queue_logical_block_size(struct request_queue *q, unsigned short size)
 {
 	q->limits.logical_block_size = size;
 
@@ -833,20 +831,24 @@ EXPORT_SYMBOL(blk_queue_update_dma_alignment);
 /**
  * blk_queue_flush - configure queue's cache flush capability
  * @q:		the request queue for the device
- * @flush:	0, REQ_FLUSH or REQ_FLUSH | REQ_FUA
+ * @flush:	0, REQ_FLUSH or REQ_FLUSH | REQ_FUA | REQ_BARRIER
  *
  * Tell block layer cache flush capability of @q.  If it supports
  * flushing, REQ_FLUSH should be set.  If it supports bypassing
- * write cache for individual writes, REQ_FUA should be set.
+ * write cache for individual writes, REQ_FUA should be set. If cache
+ * barrier is supported set REQ_BARRIER.
  */
 void blk_queue_flush(struct request_queue *q, unsigned int flush)
 {
-	WARN_ON_ONCE(flush & ~(REQ_FLUSH | REQ_FUA));
+	WARN_ON_ONCE(flush & ~(REQ_FLUSH | REQ_FUA | REQ_BARRIER));
 
-	if (WARN_ON_ONCE(!(flush & REQ_FLUSH) && (flush & REQ_FUA)))
+	if (WARN_ON_ONCE(!(flush & REQ_FLUSH) && ((flush & REQ_FUA) ||
+			(flush & REQ_BARRIER)))) {
 		flush &= ~REQ_FUA;
+		flush &= ~REQ_BARRIER;
+	}
 
-	q->flush_flags = flush & (REQ_FLUSH | REQ_FUA);
+	q->flush_flags = flush & (REQ_FLUSH | REQ_FUA | REQ_BARRIER);
 }
 EXPORT_SYMBOL_GPL(blk_queue_flush);
 

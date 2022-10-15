@@ -179,6 +179,32 @@ static struct attribute_group crash_note_cpu_attr_group = {
 };
 #endif
 
+static ssize_t uevent_suppress_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	bool val;
+	int ret;
+
+	ret = strtobool(buf, &val);
+	if (ret < 0)
+		return ret;
+
+	dev_set_uevent_suppress(dev, val);
+	return count;
+}
+
+static DEVICE_ATTR_WO(uevent_suppress);
+
+static struct attribute *uevent_suppress_cpu_attrs[] = {
+	&dev_attr_uevent_suppress.attr,
+	NULL
+};
+
+static struct attribute_group uevent_suppress_cpu_attr_group = {
+	.attrs = uevent_suppress_cpu_attrs,
+};
+
 static const struct attribute_group *common_cpu_attr_groups[] = {
 #ifdef CONFIG_KEXEC
 	&crash_note_cpu_attr_group,
@@ -190,6 +216,7 @@ static const struct attribute_group *hotplugable_cpu_attr_groups[] = {
 #ifdef CONFIG_KEXEC
 	&crash_note_cpu_attr_group,
 #endif
+	&uevent_suppress_cpu_attr_group,
 	NULL
 };
 
@@ -366,6 +393,60 @@ struct device *get_cpu_device(unsigned cpu)
 }
 EXPORT_SYMBOL_GPL(get_cpu_device);
 
+static void device_create_release(struct device *dev)
+{
+	kfree(dev);
+}
+
+static struct device *
+__cpu_device_create(struct device *parent, void *drvdata,
+		    const struct attribute_group **groups,
+		    const char *fmt, va_list args)
+{
+	struct device *dev = NULL;
+	int retval = -ENODEV;
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev) {
+		retval = -ENOMEM;
+		goto error;
+	}
+
+	device_initialize(dev);
+	dev->parent = parent;
+	dev->groups = groups;
+	dev->release = device_create_release;
+	dev_set_drvdata(dev, drvdata);
+
+	retval = kobject_set_name_vargs(&dev->kobj, fmt, args);
+	if (retval)
+		goto error;
+
+	retval = device_add(dev);
+	if (retval)
+		goto error;
+
+	return dev;
+
+error:
+	put_device(dev);
+	return ERR_PTR(retval);
+}
+
+struct device *cpu_device_create(struct device *parent, void *drvdata,
+				 const struct attribute_group **groups,
+				 const char *fmt, ...)
+{
+	va_list vargs;
+	struct device *dev;
+
+	va_start(vargs, fmt);
+	dev = __cpu_device_create(parent, drvdata, groups, fmt, vargs);
+	va_end(vargs);
+	return dev;
+}
+EXPORT_SYMBOL_GPL(cpu_device_create);
+
 #ifdef CONFIG_GENERIC_CPU_AUTOPROBE
 static DEVICE_ATTR(modalias, 0444, print_cpu_modalias, NULL);
 #endif
@@ -418,58 +499,10 @@ static void __init cpu_dev_register_generic(void)
 #endif
 }
 
-#ifdef CONFIG_GENERIC_CPU_VULNERABILITIES
-
-ssize_t __weak cpu_show_meltdown(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	return sprintf(buf, "Not affected\n");
-}
-
-ssize_t __weak cpu_show_spectre_v1(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	return sprintf(buf, "Not affected\n");
-}
-
-ssize_t __weak cpu_show_spectre_v2(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	return sprintf(buf, "Not affected\n");
-}
-
-static DEVICE_ATTR(meltdown, 0444, cpu_show_meltdown, NULL);
-static DEVICE_ATTR(spectre_v1, 0444, cpu_show_spectre_v1, NULL);
-static DEVICE_ATTR(spectre_v2, 0444, cpu_show_spectre_v2, NULL);
-
-static struct attribute *cpu_root_vulnerabilities_attrs[] = {
-	&dev_attr_meltdown.attr,
-	&dev_attr_spectre_v1.attr,
-	&dev_attr_spectre_v2.attr,
-	NULL
-};
-
-static const struct attribute_group cpu_root_vulnerabilities_group = {
-	.name  = "vulnerabilities",
-	.attrs = cpu_root_vulnerabilities_attrs,
-};
-
-static void __init cpu_register_vulnerabilities(void)
-{
-	if (sysfs_create_group(&cpu_subsys.dev_root->kobj,
-			       &cpu_root_vulnerabilities_group))
-		pr_err("Unable to register CPU vulnerabilities\n");
-}
-
-#else
-static inline void cpu_register_vulnerabilities(void) { }
-#endif
-
 void __init cpu_dev_init(void)
 {
 	if (subsys_system_register(&cpu_subsys, cpu_root_attr_groups))
 		panic("Failed to register CPU subsystem");
 
 	cpu_dev_register_generic();
-	cpu_register_vulnerabilities();
 }

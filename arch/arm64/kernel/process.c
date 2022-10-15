@@ -44,6 +44,9 @@
 #include <linux/personality.h>
 #include <linux/notifier.h>
 
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+#include <linux/percpu.h>
+#endif
 #include <asm/alternative.h>
 #include <asm/compat.h>
 #include <asm/cacheflush.h>
@@ -56,6 +59,10 @@
 #include <linux/stackprotector.h>
 unsigned long __stack_chk_guard __read_mostly;
 EXPORT_SYMBOL(__stack_chk_guard);
+#endif
+
+#ifdef CONFIG_RKP_CFP_ROPP
+#include <linux/rkp_cfp.h>
 #endif
 
 /*
@@ -77,6 +84,16 @@ void arch_cpu_idle(void)
 	 */
 	cpu_do_idle();
 	local_irq_enable();
+}
+
+void arch_cpu_idle_enter(void)
+{
+	idle_notifier_call_chain(IDLE_START);
+}
+
+void arch_cpu_idle_exit(void)
+{
+	idle_notifier_call_chain(IDLE_END);
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -203,18 +220,12 @@ static void show_data(unsigned long addr, int nbytes, const char *name)
 static void show_extra_register_data(struct pt_regs *regs, int nbytes)
 {
 	mm_segment_t fs;
-	unsigned int i;
 
 	fs = get_fs();
 	set_fs(KERNEL_DS);
 	show_data(regs->pc - nbytes, nbytes * 2, "PC");
 	show_data(regs->regs[30] - nbytes, nbytes * 2, "LR");
 	show_data(regs->sp - nbytes, nbytes * 2, "SP");
-	for (i = 0; i < 30; i++) {
-		char name[4];
-		snprintf(name, sizeof(name), "X%u", i);
-		show_data(regs->regs[i] - nbytes, nbytes * 2, name);
-	}
 	set_fs(fs);
 }
 
@@ -245,7 +256,7 @@ void __show_regs(struct pt_regs *regs)
 			printk("\n");
 	}
 	if (!user_mode(regs))
-		show_extra_register_data(regs, 128);
+		show_extra_register_data(regs, 256);
 	printk("\n");
 }
 
@@ -306,6 +317,7 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	struct pt_regs *childregs = task_pt_regs(p);
 	unsigned long tls = p->thread.tp_value;
 
+
 	memset(&p->thread.cpu_context, 0, sizeof(struct cpu_context));
 
 	/*
@@ -351,6 +363,9 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 		p->thread.cpu_context.x19 = stack_start;
 		p->thread.cpu_context.x20 = stk_sz;
 	}
+#ifdef CONFIG_RKP_CFP_ROPP
+	rkp_cfp_ropp_change_keys(p);
+#endif
 	p->thread.cpu_context.pc = (unsigned long)ret_from_fork;
 	p->thread.cpu_context.sp = (unsigned long)childregs;
 	p->thread.tp_value = tls;
@@ -387,6 +402,22 @@ static void uao_thread_switch(struct task_struct *next)
 	}
 }
 
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+/*
+ * We store our current task in sp_el0, which is clobbered by userspace. Keep a
+ * shadow copy so that we can restore this upon entry from userspace.
+ *
+ * This is *only* for exception entry from EL0, and is not valid until we
+ * __switch_to() a user task.
+ */
+DEFINE_PER_CPU(struct task_struct *, __entry_task);
+
+static void entry_task_switch(struct task_struct *next)
+{
+	__this_cpu_write(__entry_task, next);
+}
+#endif
+
 /*
  * Thread switching.
  */
@@ -399,6 +430,9 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	tls_thread_switch(next);
 	hw_breakpoint_thread_switch(next);
 	contextidr_thread_switch(next);
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	entry_task_switch(next);
+#endif
 	uao_thread_switch(next);
 
 	/*

@@ -96,7 +96,7 @@ int platform_get_irq(struct platform_device *dev, unsigned int num)
 		int ret;
 
 		ret = of_irq_get(dev->dev.of_node, num);
-		if (ret > 0 || ret == -EPROBE_DEFER)
+		if (ret >= 0 || ret == -EPROBE_DEFER)
 			return ret;
 	}
 
@@ -154,7 +154,7 @@ int platform_get_irq_byname(struct platform_device *dev, const char *name)
 		int ret;
 
 		ret = of_irq_get_byname(dev->dev.of_node, name);
-		if (ret > 0 || ret == -EPROBE_DEFER)
+		if (ret >= 0 || ret == -EPROBE_DEFER)
 			return ret;
 	}
 
@@ -514,14 +514,9 @@ static int platform_drv_probe(struct device *_dev)
 
 	ret = dev_pm_domain_attach(_dev, true);
 	if (ret != -EPROBE_DEFER) {
-		if (drv->probe) {
-			ret = drv->probe(dev);
-			if (ret)
-				dev_pm_domain_detach(_dev, true);
-		} else {
-			/* don't fail if just dev_pm_domain_attach failed */
-			ret = 0;
-		}
+		ret = drv->probe(dev);
+		if (ret)
+			dev_pm_domain_detach(_dev, true);
 	}
 
 	if (drv->prevent_deferred_probe && ret == -EPROBE_DEFER) {
@@ -625,8 +620,6 @@ int __init_or_module platform_driver_probe(struct platform_driver *drv,
 	/* temporary section violation during probe() */
 	drv->probe = probe;
 	retval = code = platform_driver_register(drv);
-	if (retval)
-		return retval;
 
 	/*
 	 * Fixup that section violation, being paranoid about code scanning
@@ -736,7 +729,7 @@ static ssize_t driver_override_store(struct device *dev,
 	struct platform_device *pdev = to_platform_device(dev);
 	char *driver_override, *old, *cp;
 
-	/* We need to keep extra room for a newline */
+	/* We need to keep extra room for a newline  */
 	if (count >= (PAGE_SIZE - 1))
 		return -EINVAL;
 
@@ -1026,6 +1019,7 @@ int __init platform_bus_init(void)
 	error =  bus_register(&platform_bus_type);
 	if (error)
 		device_unregister(&platform_bus);
+	of_platform_register_reconfig_notifier();
 	return error;
 }
 

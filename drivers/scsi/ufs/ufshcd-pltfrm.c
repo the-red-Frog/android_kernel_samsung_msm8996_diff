@@ -36,22 +36,13 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/gpio.h>
+#include <linux/of_gpio.h>
 
 #include "ufshcd.h"
 
 static const struct of_device_id ufs_of_match[];
-static struct ufs_hba_variant_ops *get_variant_ops(struct device *dev)
-{
-	if (dev->of_node) {
-		const struct of_device_id *match;
-
-		match = of_match_node(ufs_of_match, dev->of_node);
-		if (match)
-			return (struct ufs_hba_variant_ops *)match->data;
-	}
-
-	return NULL;
-}
 
 static int ufshcd_parse_clock_info(struct ufs_hba *hba)
 {
@@ -174,7 +165,7 @@ static int ufshcd_populate_vreg(struct device *dev, const char *name,
 	if (ret) {
 		dev_err(dev, "%s: unable to find %s err %d\n",
 				__func__, prop_name, ret);
-		goto out_free;
+		goto out;
 	}
 
 	vreg->min_uA = 0;
@@ -196,9 +187,6 @@ static int ufshcd_populate_vreg(struct device *dev, const char *name,
 
 	goto out;
 
-out_free:
-	devm_kfree(dev, vreg);
-	vreg = NULL;
 out:
 	if (!ret)
 		*out_vreg = vreg;
@@ -237,7 +225,20 @@ out:
 	return err;
 }
 
-#ifdef CONFIG_PM
+static void ufshcd_parse_pm_levels(struct ufs_hba *hba)
+{
+	struct device *dev = hba->dev;
+	struct device_node *np = dev->of_node;
+
+	if (np) {
+		if (of_property_read_u32(np, "rpm-level", &hba->rpm_lvl))
+			hba->rpm_lvl = -1;
+		if (of_property_read_u32(np, "spm-level", &hba->spm_lvl))
+			hba->spm_lvl = -1;
+	}
+}
+
+#ifdef CONFIG_SMP
 /**
  * ufshcd_pltfrm_suspend - suspend power management function
  * @dev: pointer to device handle
@@ -290,6 +291,49 @@ static void ufshcd_pltfrm_shutdown(struct platform_device *pdev)
 	ufshcd_shutdown((struct ufs_hba *)platform_get_drvdata(pdev));
 }
 
+static void ufshcd_parse_gpio_controls(struct ufs_hba *hba)
+{
+	struct device *dev = hba->dev;
+	struct device_node *np = dev->of_node;
+	struct pinctrl *ufs_hw_reset_pinctrl;
+	struct pinctrl_state *ufs_power_on;
+	struct pinctrl_state *ufs_power_off;
+	int ret = 0;
+
+	hba->hw_reset_gpio = of_get_named_gpio(np, "sec-ufs,hw-reset-gpio", 0);
+
+	if (!gpio_is_valid(hba->hw_reset_gpio))
+		return;
+
+	pr_err("UFS get hw_reset gpio %d.\n", hba->hw_reset_gpio);
+
+	ufs_hw_reset_pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR(ufs_hw_reset_pinctrl)) {
+		pr_err("%s: pinctrl_get is failed.\n", __func__);
+		ufs_hw_reset_pinctrl = NULL;
+	} else {
+		ufs_power_on = pinctrl_lookup_state(ufs_hw_reset_pinctrl, "ufs_poweron");
+		if (IS_ERR(ufs_power_on)) {
+			pr_err("%s: fail to ufs_poweron lookup_state.\n", __func__);
+			goto err_exit;
+		}
+
+		ufs_power_off = pinctrl_lookup_state(ufs_hw_reset_pinctrl, "ufs_poweroff");
+		if (IS_ERR(ufs_power_off)) {
+			pr_err("%s: fail to ufs_poweroff lookup_state.\n", __func__);
+			goto err_exit;
+		}
+
+		ret = pinctrl_select_state(ufs_hw_reset_pinctrl, ufs_power_on);
+		if (ret)
+			pr_err("%s: fail to select_state ufs power on.\n", __func__);
+
+ err_exit:
+		devm_pinctrl_put(ufs_hw_reset_pinctrl);
+	}
+	return;
+}
+
 /**
  * ufshcd_pltfrm_probe - probe routine of the driver
  * @pdev: pointer to Platform device handle
@@ -303,6 +347,9 @@ static int ufshcd_pltfrm_probe(struct platform_device *pdev)
 	struct resource *mem_res;
 	int irq, err;
 	struct device *dev = &pdev->dev;
+	struct device_node *node = pdev->dev.of_node;
+	struct device_node *ufs_variant_node;
+	struct platform_device *ufs_variant_pdev;
 
 	mem_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	mmio_base = devm_ioremap_resource(dev, mem_res);
@@ -324,37 +371,61 @@ static int ufshcd_pltfrm_probe(struct platform_device *pdev)
 		goto out;
 	}
 
-	hba->vops = get_variant_ops(&pdev->dev);
+	err = of_platform_populate(node, NULL, NULL, &pdev->dev);
+	if (err) {
+		dev_err(&pdev->dev,
+			"%s: of_platform_populate() failed\n", __func__);
+	} else {
+		ufs_variant_node = of_get_next_available_child(node, NULL);
+
+		if (!ufs_variant_node) {
+			dev_dbg(&pdev->dev, "no ufs_variant_node found\n");
+		} else {
+			ufs_variant_pdev =
+				of_find_device_by_node(ufs_variant_node);
+
+			if (ufs_variant_pdev)
+				hba->var = (struct ufs_hba_variant *)
+				     dev_get_drvdata(&ufs_variant_pdev->dev);
+		}
+	}
 
 	err = ufshcd_parse_clock_info(hba);
 	if (err) {
 		dev_err(&pdev->dev, "%s: clock parse failed %d\n",
 				__func__, err);
-		goto out;
+		goto dealloc_host;
 	}
 	err = ufshcd_parse_regulator_info(hba);
 	if (err) {
 		dev_err(&pdev->dev, "%s: regulator init failed %d\n",
 				__func__, err);
-		goto out;
+		goto dealloc_host;
 	}
 
-	pm_runtime_set_active(&pdev->dev);
-	pm_runtime_enable(&pdev->dev);
+	ufshcd_parse_pm_levels(hba);
+
+	ufshcd_parse_gpio_controls(hba);
+
+	if (!dev->dma_mask)
+		dev->dma_mask = &dev->coherent_dma_mask;
 
 	err = ufshcd_init(hba, mmio_base, irq);
 	if (err) {
 		dev_err(dev, "Intialization failed\n");
-		goto out_disable_rpm;
+		goto dealloc_host;
 	}
 
 	platform_set_drvdata(pdev, hba);
 
-	return 0;
+	pm_runtime_set_active(&pdev->dev);
+#if 0	/* runtime PM has no effect on UFS host */
+	pm_runtime_enable(&pdev->dev);
+#endif
 
-out_disable_rpm:
-	pm_runtime_disable(&pdev->dev);
-	pm_runtime_set_suspended(&pdev->dev);
+	return 0;
+dealloc_host:
+	ufshcd_dealloc_host(hba);
 out:
 	return err;
 }
@@ -371,6 +442,7 @@ static int ufshcd_pltfrm_remove(struct platform_device *pdev)
 
 	pm_runtime_get_sync(&(pdev)->dev);
 	ufshcd_remove(hba);
+	ufshcd_dealloc_host(hba);
 	return 0;
 }
 

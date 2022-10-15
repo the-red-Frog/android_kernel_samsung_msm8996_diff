@@ -590,6 +590,114 @@ power_attr(pm_freeze_timeout);
 
 #endif	/* CONFIG_FREEZER*/
 
+#ifdef CONFIG_SEC_PM
+extern int qpnp_set_resin_wk_int(int en);
+static int volkey_wakeup = 1;
+static ssize_t volkey_wakeup_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", volkey_wakeup);
+}
+
+static ssize_t volkey_wakeup_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t n)
+{
+	int val;
+
+	if (sscanf(buf, "%d", &val) != 1)
+		return -EINVAL;
+
+	volkey_wakeup = val;
+	qpnp_set_resin_wk_int(volkey_wakeup);
+
+	return n;
+
+}
+
+power_attr(volkey_wakeup);
+#endif /* CONFIG_SEC_PM */
+
+#if defined(CONFIG_SW_SELF_DISCHARGING)
+static char selfdischg_usage_str[] =
+#if defined(CONFIG_ARCH_MSM8996)
+	"[START]\n"
+	"/sys/module/lpm_levels/system/pwr/cpu0/wfi/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/pwr/cpu0/fpc-def/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/pwr/cpu0/fpc/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/pwr/cpu1/wfi/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/pwr/cpu1/fpc-def/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/pwr/cpu1/fpc/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/perf/cpu2/wfi/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/perf/cpu2/fpc-def/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/perf/cpu2/fpc/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/perf/cpu3/wfi/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/perf/cpu3/fpc-def/idle_enabled N\n"
+	"/sys/module/lpm_levels/system/perf/cpu3/fpc/idle_enabled N\n"
+	"[STOP]\n"
+	"/sys/module/lpm_levels/system/pwr/cpu0/wfi/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/pwr/cpu0/fpc-def/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/pwr/cpu0/fpc/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/pwr/cpu1/wfi/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/pwr/cpu1/fpc-def/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/pwr/cpu1/fpc/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/perf/cpu2/wfi/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/perf/cpu2/fpc-def/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/perf/cpu2/fpc/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/perf/cpu3/wfi/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/perf/cpu3/fpc-def/idle_enabled Y\n"
+	"/sys/module/lpm_levels/system/perf/cpu3/fpc/idle_enabled Y\n"
+	"[END]\n";
+#else
+	"[NOT_SUPPORT]\n";
+#endif
+
+static ssize_t selfdischg_usage_show(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					char *buf)
+{
+	pr_info("%s\n", __func__);
+	return sprintf(buf, "%s", selfdischg_usage_str);
+}
+
+static struct kobj_attribute selfdischg_usage_attr = {
+	.attr	= {
+		.name = __stringify(selfdischg_usage),
+		.mode = 0440,
+	},
+	.show	= selfdischg_usage_show,
+};
+#endif /* CONFIG_SW_SELF_DISCHARGING */
+
+#if defined(CONFIG_FOTA_LIMIT)
+static char fota_limit_str[] =
+#if defined(CONFIG_ARCH_MSM8996)
+	"[START]\n"
+	"/sys/power/cpufreq_max_limit 1190400\n"
+	"[STOP]\n"
+	"/sys/power/cpufreq_max_limit -1\n"
+	"[END]\n";
+#else
+	"[NOT_SUPPORT]\n";
+#endif
+
+static ssize_t fota_limit_show(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					char *buf)
+{
+	pr_info("%s\n", __func__);
+	return sprintf(buf, "%s", fota_limit_str);
+}
+
+static struct kobj_attribute fota_limit_attr = {
+	.attr	= {
+		.name = __stringify(fota_limit),
+		.mode = 0440,
+	},
+	.show	= fota_limit_show,
+};
+#endif /* CONFIG_FOTA_LIMIT */
+
 static struct attribute * g[] = {
 	&state_attr.attr,
 #ifdef CONFIG_PM_TRACE
@@ -616,6 +724,15 @@ static struct attribute * g[] = {
 #ifdef CONFIG_FREEZER
 	&pm_freeze_timeout_attr.attr,
 #endif
+#ifdef CONFIG_SEC_PM
+	&volkey_wakeup_attr.attr,
+#endif
+#if defined(CONFIG_SW_SELF_DISCHARGING)
+	&selfdischg_usage_attr.attr,
+#endif
+#if defined(CONFIG_FOTA_LIMIT)
+	&fota_limit_attr.attr,
+#endif /* CONFIG_FOTA_LIMIT */
 	NULL,
 };
 

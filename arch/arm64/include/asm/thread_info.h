@@ -22,6 +22,9 @@
 #ifdef __KERNEL__
 
 #include <linux/compiler.h>
+#ifdef CONFIG_RKP_CFP_ROPP
+#include <linux/rkp_cfp.h>
+#endif
 
 #ifndef CONFIG_ARM64_64K_PAGES
 #define THREAD_SIZE_ORDER	2
@@ -46,15 +49,37 @@ typedef unsigned long mm_segment_t;
 struct thread_info {
 	unsigned long		flags;		/* low level flags */
 	mm_segment_t		addr_limit;	/* address limit */
+#ifndef CONFIG_THREAD_INFO_IN_TASK
 	struct task_struct	*task;		/* main task structure */
+#endif
 	struct exec_domain	*exec_domain;	/* execution domain */
 #ifdef CONFIG_ARM64_SW_TTBR0_PAN
 	u64			ttbr0;		/* saved TTBR0_EL1 */
 #endif
 	int			preempt_count;	/* 0 => preemptable, <0 => bug */
+#ifndef CONFIG_THREAD_INFO_IN_TASK
 	int			cpu;		/* cpu */
+#endif
+#ifdef CONFIG_RKP_CFP_ROPP
+    //Todo: save key to hypervisor
+    unsigned long rrk;
+#endif
 };
 
+#ifdef CONFIG_RKP_CFP_ROPP
+# define INIT_THREAD_INFO_RKP_CFP(tsk)						\
+	.rrk = 0,
+#else
+# define INIT_THREAD_INFO_RKP_CFP(tsk)
+#endif
+
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+#define INIT_THREAD_INFO(tsk)						\
+{									\
+	.preempt_count	= INIT_PREEMPT_COUNT,				\
+	.addr_limit	= KERNEL_DS,					\
+}
+#else
 #define INIT_THREAD_INFO(tsk)						\
 {									\
 	.task		= &tsk,						\
@@ -62,10 +87,10 @@ struct thread_info {
 	.flags		= 0,						\
 	.preempt_count	= INIT_PREEMPT_COUNT,				\
 	.addr_limit	= KERNEL_DS,					\
+    INIT_THREAD_INFO_RKP_CFP(tsk) \
 }
 
 #define init_thread_info	(init_thread_union.thread_info)
-#define init_stack		(init_thread_union.stack)
 
 /*
  * how to get the current stack pointer from C
@@ -88,6 +113,9 @@ static inline struct thread_info *current_thread_info(void)
 
 	return (struct thread_info *)sp_el0;
 }
+#endif
+
+#define init_stack		(init_thread_union.stack)
 
 #define thread_saved_pc(tsk)	\
 	((unsigned long)(tsk->thread.cpu_context.pc))
@@ -113,7 +141,6 @@ static inline struct thread_info *current_thread_info(void)
 #define TIF_NEED_RESCHED	1
 #define TIF_NOTIFY_RESUME	2	/* callback before returning to user */
 #define TIF_FOREIGN_FPSTATE	3	/* CPU's FP state is not current's */
-#define TIF_FSCHECK		4	/* Check FS is USER_DS on return */
 #define TIF_NOHZ		7
 #define TIF_SYSCALL_TRACE	8
 #define TIF_SYSCALL_AUDIT	9
@@ -124,6 +151,8 @@ static inline struct thread_info *current_thread_info(void)
 #define TIF_RESTORE_SIGMASK	20
 #define TIF_SINGLESTEP		21
 #define TIF_32BIT		22	/* 32bit process */
+#define TIF_SWITCH_MM		23	/* deferred switch_mm */
+#define TIF_MM_RELEASED		24
 
 #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
 #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
@@ -134,12 +163,10 @@ static inline struct thread_info *current_thread_info(void)
 #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
 #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
 #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
-#define _TIF_FSCHECK		(1 << TIF_FSCHECK)
 #define _TIF_32BIT		(1 << TIF_32BIT)
 
 #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
-				 _TIF_NOTIFY_RESUME | _TIF_FOREIGN_FPSTATE | \
-				 _TIF_FSCHECK)
+				 _TIF_NOTIFY_RESUME | _TIF_FOREIGN_FPSTATE)
 
 #define _TIF_SYSCALL_WORK	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | \
 				 _TIF_SYSCALL_TRACEPOINT | _TIF_SECCOMP | \

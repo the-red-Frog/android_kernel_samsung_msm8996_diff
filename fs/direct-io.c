@@ -395,6 +395,8 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
 	if (dio->is_async && dio->rw == READ)
 		bio_set_pages_dirty(bio);
 
+	bio->bi_dio_inode = dio->inode;
+
 	if (sdio->submit_io)
 		sdio->submit_io(dio->rw, bio, dio->inode,
 			       sdio->logical_offset_in_bio);
@@ -405,6 +407,19 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
 	sdio->boundary = 0;
 	sdio->logical_offset_in_bio = 0;
 }
+
+struct inode *dio_bio_get_inode(struct bio *bio)
+{
+	struct inode *inode = NULL;
+
+	if (bio == NULL)
+		return NULL;
+
+	inode = bio->bi_dio_inode;
+
+	return inode;
+}
+EXPORT_SYMBOL(dio_bio_get_inode);
 
 /*
  * Release any resources in case of a failure
@@ -769,7 +784,6 @@ submit_page_section(struct dio *dio, struct dio_submit *sdio, struct page *page,
 		    struct buffer_head *map_bh)
 {
 	int ret = 0;
-	int boundary = sdio->boundary;	/* dio_send_cur_page may clear it */
 
 	if (dio->rw & WRITE) {
 		/*
@@ -808,10 +822,10 @@ submit_page_section(struct dio *dio, struct dio_submit *sdio, struct page *page,
 	sdio->cur_page_fs_offset = sdio->block_in_file << sdio->blkbits;
 out:
 	/*
-	 * If boundary then we want to schedule the IO now to
+	 * If sdio->boundary then we want to schedule the IO now to
 	 * avoid metadata seeks.
 	 */
-	if (boundary) {
+	if (sdio->boundary) {
 		ret = dio_send_cur_page(dio, sdio, map_bh);
 		if (sdio->bio)
 			dio_bio_submit(dio, sdio);

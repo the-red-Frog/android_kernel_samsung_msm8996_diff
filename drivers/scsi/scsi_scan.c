@@ -288,6 +288,13 @@ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
 	sdev->request_queue->queuedata = sdev;
 	scsi_adjust_queue_depth(sdev, 0, sdev->host->cmd_per_lun);
 
+#ifdef CONFIG_JOURNAL_DATA_TAG
+	if (shost->journal_tag == JOURNAL_TAG_ON)
+		queue_flag_set_unlocked(QUEUE_FLAG_JOURNAL_TAG, sdev->request_queue);
+	else
+		queue_flag_clear_unlocked(QUEUE_FLAG_JOURNAL_TAG, sdev->request_queue);
+#endif
+
 	scsi_sysfs_device_initialize(sdev);
 
 	if (shost->hostt->slave_alloc) {
@@ -319,7 +326,6 @@ static void scsi_target_destroy(struct scsi_target *starget)
 	struct Scsi_Host *shost = dev_to_shost(dev->parent);
 	unsigned long flags;
 
-	BUG_ON(starget->state == STARGET_DEL);
 	starget->state = STARGET_DEL;
 	transport_destroy_device(dev);
 	spin_lock_irqsave(shost->host_lock, flags);
@@ -386,12 +392,11 @@ static void scsi_target_reap_ref_release(struct kref *kref)
 		= container_of(kref, struct scsi_target, reap_ref);
 
 	/*
-	 * if we get here and the target is still in a CREATED state that
+	 * if we get here and the target is still in the CREATED state that
 	 * means it was allocated but never made visible (because a scan
 	 * turned up no LUNs), so don't call device_del() on it.
 	 */
-	if ((starget->state != STARGET_CREATED) &&
-	    (starget->state != STARGET_CREATED_REMOVE)) {
+	if (starget->state != STARGET_CREATED) {
 		transport_remove_device(&starget->dev);
 		device_del(&starget->dev);
 	}
@@ -823,13 +828,8 @@ static int scsi_add_lun(struct scsi_device *sdev, unsigned char *inq_result,
 		 * well-known logical units. Force well-known type
 		 * to enumerate them correctly.
 		 */
-		if (scsi_is_wlun(sdev->lun) && sdev->type != TYPE_WLUN) {
-			sdev_printk(KERN_WARNING, sdev,
-				"%s: correcting incorrect peripheral device type 0x%x for W-LUN 0x%16xhN\n",
-				__func__, sdev->type, (unsigned int)sdev->lun);
+		if (scsi_is_wlun(sdev->lun) && sdev->type != TYPE_WLUN)
 			sdev->type = TYPE_WLUN;
-		}
-
 	}
 
 	if (sdev->type == TYPE_RBC || sdev->type == TYPE_ROM) {
@@ -971,6 +971,10 @@ static int scsi_add_lun(struct scsi_device *sdev, unsigned char *inq_result,
 		sdev->skip_vpd_pages = 1;
 
 	transport_configure_device(&sdev->sdev_gendev);
+
+	/* The LLD can override auto suspend tunables in ->slave_configure() */
+	sdev->use_rpm_auto = 0;
+	sdev->autosuspend_delay = SCSI_DEFAULT_AUTOSUSPEND_DELAY;
 
 	if (sdev->host->hostt->slave_configure) {
 		ret = sdev->host->hostt->slave_configure(sdev);
@@ -1785,17 +1789,16 @@ static void scsi_sysfs_add_devices(struct Scsi_Host *shost)
  */
 static struct async_scan_data *scsi_prep_async_scan(struct Scsi_Host *shost)
 {
-	struct async_scan_data *data = NULL;
+	struct async_scan_data *data;
 	unsigned long flags;
 
 	if (strncmp(scsi_scan_type, "sync", 4) == 0)
 		return NULL;
 
-	mutex_lock(&shost->scan_mutex);
 	if (shost->async_scan) {
 		shost_printk(KERN_INFO, shost, "%s called twice\n", __func__);
 		dump_stack();
-		goto err;
+		return NULL;
 	}
 
 	data = kmalloc(sizeof(*data), GFP_KERNEL);
@@ -1806,6 +1809,7 @@ static struct async_scan_data *scsi_prep_async_scan(struct Scsi_Host *shost)
 		goto err;
 	init_completion(&data->prev_finished);
 
+	mutex_lock(&shost->scan_mutex);
 	spin_lock_irqsave(shost->host_lock, flags);
 	shost->async_scan = 1;
 	spin_unlock_irqrestore(shost->host_lock, flags);
@@ -1820,7 +1824,6 @@ static struct async_scan_data *scsi_prep_async_scan(struct Scsi_Host *shost)
 	return data;
 
  err:
-	mutex_unlock(&shost->scan_mutex);
 	kfree(data);
 	return NULL;
 }

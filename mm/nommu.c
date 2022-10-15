@@ -461,14 +461,10 @@ void vm_unmap_aliases(void)
 EXPORT_SYMBOL_GPL(vm_unmap_aliases);
 
 /*
- * Implement a stub for vmalloc_sync_[un]mapping() if the architecture
- * chose not to have one.
+ * Implement a stub for vmalloc_sync_all() if the architecture chose not to
+ * have one.
  */
-void __weak vmalloc_sync_mappings(void)
-{
-}
-
-void __weak vmalloc_sync_unmappings(void)
+void __weak vmalloc_sync_all(void)
 {
 }
 
@@ -1047,7 +1043,7 @@ static int validate_mmap_request(struct file *file,
 
 		/* handle executable mappings and implied executable
 		 * mappings */
-		if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
+		if (path_noexec(&file->f_path)) {
 			if (prot & PROT_EXEC)
 				return -EPERM;
 		} else if ((prot & PROT_READ) && !(prot & PROT_EXEC)) {
@@ -2007,10 +2003,9 @@ int generic_file_remap_pages(struct vm_area_struct *vma, unsigned long addr,
 EXPORT_SYMBOL(generic_file_remap_pages);
 
 static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
-		unsigned long addr, void *buf, int len, unsigned int gup_flags)
+		unsigned long addr, void *buf, int len, int write)
 {
 	struct vm_area_struct *vma;
-	int write = gup_flags & FOLL_WRITE;
 
 	down_read(&mm->mmap_sem);
 
@@ -2052,8 +2047,7 @@ static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
 int access_remote_vm(struct mm_struct *mm, unsigned long addr,
 		void *buf, int len, int write)
 {
-	return __access_remote_vm(NULL, mm, addr, buf, len,
-			write ? FOLL_WRITE : 0);
+	return __access_remote_vm(NULL, mm, addr, buf, len, write);
 }
 
 /*
@@ -2071,8 +2065,7 @@ int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, in
 	if (!mm)
 		return 0;
 
-	len = __access_remote_vm(tsk, mm, addr, buf, len,
-			write ? FOLL_WRITE : 0);
+	len = __access_remote_vm(tsk, mm, addr, buf, len, write);
 
 	mmput(mm);
 	return len;

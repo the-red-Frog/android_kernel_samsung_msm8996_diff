@@ -6,6 +6,7 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/pci.h>
+#include <linux/of_pci.h>
 #include <linux/pci_hotplug.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -224,8 +225,7 @@ int __pci_read_base(struct pci_dev *dev, enum pci_bar_type type,
 			mask = (u32)PCI_BASE_ADDRESS_MEM_MASK;
 		}
 	} else {
-		if (l & PCI_ROM_ADDRESS_ENABLE)
-			res->flags |= IORESOURCE_ROM_ENABLE;
+		res->flags |= (l & IORESOURCE_ROM_ENABLE);
 		l &= PCI_ROM_ADDRESS_MASK;
 		sz &= PCI_ROM_ADDRESS_MASK;
 		mask = (u32)PCI_ROM_ADDRESS_MASK;
@@ -677,6 +677,35 @@ static void pci_set_bus_speed(struct pci_bus *bus)
 	}
 }
 
+static struct irq_domain *pci_host_bridge_msi_domain(struct pci_bus *bus)
+{
+	struct irq_domain *d;
+
+	/*
+	 * Any firmware interface that can resolve the msi_domain
+	 * should be called from here.
+	 */
+	d = pci_host_bridge_of_msi_domain(bus);
+
+	return d;
+}
+
+static void pci_set_bus_msi_domain(struct pci_bus *bus)
+{
+	struct irq_domain *d;
+
+	/*
+	 * Either bus is the root, and we must obtain it from the
+	 * firmware, or we inherit it from the bridge device.
+	 */
+	if (pci_is_root_bus(bus))
+		d = pci_host_bridge_msi_domain(bus);
+	else
+		d = dev_get_msi_domain(&bus->self->dev);
+
+	dev_set_msi_domain(&bus->dev, d);
+}
+
 static struct pci_bus *pci_alloc_child_bus(struct pci_bus *parent,
 					   struct pci_dev *bridge, int busnr)
 {
@@ -730,6 +759,7 @@ static struct pci_bus *pci_alloc_child_bus(struct pci_bus *parent,
 	bridge->subordinate = child;
 
 add_dev:
+	pci_set_bus_msi_domain(child);
 	ret = device_register(&child->dev);
 	WARN_ON(ret < 0);
 
@@ -995,7 +1025,6 @@ void set_pcie_port_type(struct pci_dev *pdev)
 	pos = pci_find_capability(pdev, PCI_CAP_ID_EXP);
 	if (!pos)
 		return;
-
 	pdev->pcie_cap = pos;
 	pci_read_config_word(pdev, pos + PCI_EXP_FLAGS, &reg16);
 	pdev->pcie_flags_reg = reg16;
@@ -1003,19 +1032,18 @@ void set_pcie_port_type(struct pci_dev *pdev)
 	pdev->pcie_mpss = reg16 & PCI_EXP_DEVCAP_PAYLOAD;
 
 	/*
-	 * A Root Port or a PCI-to-PCIe bridge is always the upstream end
-	 * of a Link.  No PCIe component has two Links.  Two Links are
-	 * connected by a Switch that has a Port on each Link and internal
-	 * logic to connect the two Ports.
+	 * A Root Port is always the upstream end of a Link.  No PCIe
+	 * component has two Links.  Two Links are connected by a Switch
+	 * that has a Port on each Link and internal logic to connect the
+	 * two Ports.
 	 */
 	type = pci_pcie_type(pdev);
-	if (type == PCI_EXP_TYPE_ROOT_PORT ||
-	    type == PCI_EXP_TYPE_PCIE_BRIDGE)
+	if (type == PCI_EXP_TYPE_ROOT_PORT)
 		pdev->has_secondary_link = 1;
 	else if (type == PCI_EXP_TYPE_UPSTREAM ||
 		 type == PCI_EXP_TYPE_DOWNSTREAM) {
 		parent = pci_upstream_bridge(pdev);
-		if (!parent->has_secondary_link)
+		if (parent && !parent->has_secondary_link)
 			pdev->has_secondary_link = 1;
 	}
 }
@@ -1121,6 +1149,22 @@ int pci_cfg_space_size(struct pci_dev *dev)
 
 #define LEGACY_IO_RESOURCE	(IORESOURCE_IO | IORESOURCE_PCI_FIXED)
 
+static void pci_msi_setup_pci_dev(struct pci_dev *dev)
+{
+	/*
+	 * Disable the MSI hardware to avoid screaming interrupts
+	 * during boot.  This is the power on reset default so
+	 * usually this should be a noop.
+	 */
+	dev->msi_cap = pci_find_capability(dev, PCI_CAP_ID_MSI);
+	if (dev->msi_cap)
+		pci_msi_set_enable(dev, 0);
+
+	dev->msix_cap = pci_find_capability(dev, PCI_CAP_ID_MSIX);
+	if (dev->msix_cap)
+		pci_msix_clear_and_set_ctrl(dev, PCI_MSIX_FLAGS_ENABLE, 0);
+}
+
 /**
  * pci_setup_device - fill in class and map information of a device
  * @dev: the device structure to fill
@@ -1177,12 +1221,14 @@ int pci_setup_device(struct pci_dev *dev)
 	/* "Unknown power state" */
 	dev->current_state = PCI_UNKNOWN;
 
+	pci_msi_setup_pci_dev(dev);
+
 	/* Early fixups, before probing the BARs */
 	pci_fixup_device(pci_fixup_early, dev);
 	/* device class may be changed after fixup */
 	class = dev->class >> 8;
 
-	if (dev->non_compliant_bars && !dev->mmio_always_on) {
+	if (dev->non_compliant_bars) {
 		pci_read_config_word(dev, PCI_COMMAND, &cmd);
 		if (cmd & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY)) {
 			dev_info(&dev->dev, "device has non-compliant BARs; disabling IO/MEM decoding\n");
@@ -1344,21 +1390,6 @@ static void program_hpp_type1(struct pci_dev *dev, struct hpp_type1 *hpp)
 	dev_warn(&dev->dev, "PCI-X settings not supported\n");
 }
 
-static bool pcie_root_rcb_set(struct pci_dev *dev)
-{
-	struct pci_dev *rp = pcie_find_root_port(dev);
-	u16 lnkctl;
-
-	if (!rp)
-		return false;
-
-	pcie_capability_read_word(rp, PCI_EXP_LNKCTL, &lnkctl);
-	if (lnkctl & PCI_EXP_LNKCTL_RCB)
-		return true;
-
-	return false;
-}
-
 static void program_hpp_type2(struct pci_dev *dev, struct hpp_type2 *hpp)
 {
 	int pos;
@@ -1391,20 +1422,9 @@ static void program_hpp_type2(struct pci_dev *dev, struct hpp_type2 *hpp)
 			~hpp->pci_exp_devctl_and, hpp->pci_exp_devctl_or);
 
 	/* Initialize Link Control Register */
-	if (pcie_cap_has_lnkctl(dev)) {
-
-		/*
-		 * If the Root Port supports Read Completion Boundary of
-		 * 128, set RCB to 128.  Otherwise, clear it.
-		 */
-		hpp->pci_exp_lnkctl_and |= PCI_EXP_LNKCTL_RCB;
-		hpp->pci_exp_lnkctl_or &= ~PCI_EXP_LNKCTL_RCB;
-		if (pcie_root_rcb_set(dev))
-			hpp->pci_exp_lnkctl_or |= PCI_EXP_LNKCTL_RCB;
-
+	if (pcie_cap_has_lnkctl(dev))
 		pcie_capability_clear_and_set_word(dev, PCI_EXP_LNKCTL,
 			~hpp->pci_exp_lnkctl_and, hpp->pci_exp_lnkctl_or);
-	}
 
 	/* Find Advanced Error Reporting Enhanced Capability */
 	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ERR);
@@ -1560,7 +1580,6 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 	pci_set_of_node(dev);
 
 	if (pci_setup_device(dev)) {
-		pci_release_of_node(dev);
 		pci_bus_put(dev->bus);
 		kfree(dev);
 		return NULL;
@@ -1593,6 +1612,17 @@ static void pci_init_capabilities(struct pci_dev *dev)
 	pci_enable_acs(dev);
 }
 
+static void pci_set_msi_domain(struct pci_dev *dev)
+{
+	/*
+	 * If no domain has been set through the pcibios_add_device
+	 * callback, inherit the default from the bus device.
+	 */
+	if (!dev_get_msi_domain(&dev->dev))
+		dev_set_msi_domain(&dev->dev,
+				   dev_get_msi_domain(&dev->bus->dev));
+}
+
 void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 {
 	int ret;
@@ -1606,6 +1636,7 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 	dev->dev.dma_mask = &dev->dma_mask;
 	dev->dev.dma_parms = &dev->dma_parms;
 	dev->dev.coherent_dma_mask = 0xffffffffull;
+	of_pci_dma_configure(dev);
 
 	pci_set_dma_max_seg_size(dev, 65536);
 	pci_set_dma_seg_boundary(dev, 0xffffffff);
@@ -1632,6 +1663,9 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 
 	ret = pcibios_add_device(dev);
 	WARN_ON(ret < 0);
+
+	/* Setup MSI irq domain */
+	pci_set_msi_domain(dev);
 
 	/* Notifier could use PCI capabilities */
 	dev->match_driver = false;
@@ -2023,6 +2057,7 @@ struct pci_bus *pci_create_root_bus(struct device *parent, int bus,
 	b->bridge = get_device(&bridge->dev);
 	device_enable_async_suspend(b->bridge);
 	pci_set_bus_of_node(b);
+	pci_set_bus_msi_domain(b);
 
 	if (!parent)
 		set_dev_node(b->bridge, pcibus_to_node(b));
@@ -2173,7 +2208,6 @@ struct pci_bus *pci_scan_root_bus(struct device *parent, int bus,
 	if (!found)
 		pci_bus_update_busn_res_end(b, max);
 
-	pci_bus_add_devices(b);
 	return b;
 }
 EXPORT_SYMBOL(pci_scan_root_bus);
@@ -2209,7 +2243,6 @@ struct pci_bus *pci_scan_bus(int bus, struct pci_ops *ops,
 	b = pci_create_root_bus(NULL, bus, ops, sysdata, &resources);
 	if (b) {
 		pci_scan_child_bus(b);
-		pci_bus_add_devices(b);
 	} else {
 		pci_free_resource_list(&resources);
 	}

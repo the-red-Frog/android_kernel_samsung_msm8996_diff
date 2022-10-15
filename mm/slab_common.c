@@ -229,7 +229,7 @@ struct kmem_cache *find_mergeable(size_t size, size_t align,
 {
 	struct kmem_cache *s;
 
-	if (slab_nomerge)
+	if (slab_nomerge || (flags & SLAB_NEVER_MERGE))
 		return NULL;
 
 	if (ctor)
@@ -239,9 +239,6 @@ struct kmem_cache *find_mergeable(size_t size, size_t align,
 	align = calculate_alignment(flags, align, size);
 	size = ALIGN(size, align);
 	flags = kmem_cache_flags(size, flags, name, NULL);
-
-	if (flags & SLAB_NEVER_MERGE)
-		return NULL;
 
 	list_for_each_entry(s, &slab_caches, list) {
 		if (slab_unmergeable(s))
@@ -792,6 +789,7 @@ void *kmalloc_order(size_t size, gfp_t flags, unsigned int order)
 	page = alloc_kmem_pages(flags, order);
 	ret = page ? page_address(page) : NULL;
 	kmemleak_alloc(ret, size, 1, flags);
+	kasan_kmalloc_large(ret, size);
 	return ret;
 }
 EXPORT_SYMBOL(kmalloc_order);
@@ -966,8 +964,10 @@ static __always_inline void *__do_krealloc(const void *p, size_t new_size,
 	if (p)
 		ks = ksize(p);
 
-	if (ks >= new_size)
+	if (ks >= new_size) {
+		kasan_krealloc((void *)p, new_size);
 		return (void *)p;
+	}
 
 	ret = kmalloc_track_caller(new_size, flags);
 	if (ret && p)
@@ -1043,7 +1043,7 @@ void kzfree(const void *p)
 	if (unlikely(ZERO_OR_NULL_PTR(mem)))
 		return;
 	ks = ksize(mem);
-	memzero_explicit(mem, ks);
+	memset(mem, 0, ks);
 	kfree(mem);
 }
 EXPORT_SYMBOL(kzfree);
